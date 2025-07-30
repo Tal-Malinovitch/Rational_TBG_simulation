@@ -1,5 +1,5 @@
 import numpy as np
-from scipy.sparse import lil_matrix,csr_matrix
+from scipy.sparse import lil_matrix,csr_matrix,coo_matrix
 from scipy.sparse.linalg import eigs, eigsh, ArpackNoConvergence
 from scipy.spatial import cKDTree
 from matplotlib.patches import Polygon
@@ -535,7 +535,7 @@ class periodic_graph(graph):
         self.num_of_periodic_edges=0
         self.edges_list=[]
 
-    def build_adj_matrix(self,inter_graph_weight:float=1.0,intra_graph_weight:float=1.0)->tuple[lil_matrix,list[int,int,tuple[int,int]]]: 
+    def build_adj_matrix(self,inter_graph_weight:float=1.0,intra_graph_weight:float=1.0)->tuple[csr_matrix,list[int,int,tuple[int,int]]]: 
         """
         Construct the Laplacian matrix ignoring periodic phase factors.
 
@@ -545,56 +545,75 @@ class periodic_graph(graph):
 
         Returns:
             tuple: A tuple containing:
-                - laplacian (scipy.sparse.lil_matrix): Initial Laplacian matrix.
+                - laplacian (scipy.sparse.csr_matrix): Initial Laplacian matrix.
                 - periodic_edges (list): List of periodic edges needing phase factors.
         Raises:
             ValueError- if the matrix is not Hermitian
         """
         n = len(self.nodes)
-        laplacian = lil_matrix((n, n), dtype=complex)
+        #precompute that hashing node graph index to index
+        node_key_to_index = {(node.lattice_index,node.sublattice_id): i for i, node in enumerate(self.nodes)}
+        row_indices = []
+        col_indices = []
+        data = []
+        processed_edges = set()
+        # laplacian = lil_matrix((n, n), dtype=complex)
         periodic_edges=[]
         for i, node in enumerate(self.nodes):
-            laplacian[i, i] = 0 #For now solving the free particle case, so the diagonal is zero.  
+            #For now solving the free particle case, so the diagonal is zero.  
+            row_indices.append(i)
+            col_indices.append(i)
+            data.append(0.0 + 0.0j) 
             for neighbor, periodic_offset in node.neighbors:
-                j = self.nodes.index(neighbor)
-
-                if periodic_offset==(0,0) and node.sublattice_id == neighbor.sublattice_id:
-                    laplacian[i, j] += intra_graph_weight 
-                elif periodic_offset==(0,0):
-                    laplacian[i, j] += inter_graph_weight
+                j = node_key_to_index[(neighbor.lattice_index,neighbor.sublattice_id)]
+                edge_key = (min(i, j), max(i, j), periodic_offset)
+                if edge_key in processed_edges:
+                    continue
+                processed_edges.add(edge_key)
+                if periodic_offset == (0, 0):
+                # Intra-cell edge
+                    if node.sublattice_id == neighbor.sublattice_id:
+                        weight = intra_graph_weight
+                    else:
+                        weight = inter_graph_weight
+                    # Add both (i,j) and (j,i) for symmetry
+                    row_indices.extend([i, j])
+                    col_indices.extend([j, i])
+                    data.extend([weight, weight])
                 else:
-                    periodic_edges.append([i,j,periodic_offset]) # periodic offset is in relativve cooredinates
-        hermitian_check = laplacian != laplacian.getH()
-
-        if hermitian_check.nnz != 0:
-            # Get the indices where the matrix is not equal to its Hermitian conjugate
-            # For a sparse matrix, you can convert to COO format to get row/col/data
-            non_hermitian_indices_r, non_hermitian_indices_c, _ = hermitian_check.nonzero()
-
-            error_messages = []
-            # Iterate through a few non-Hermitian entries to provide examples
-            for i in range(min(5, len(non_hermitian_indices_r))): # Check up to 5 entries
-                r, c = non_hermitian_indices_r[i], non_hermitian_indices_c[i]
-                val_at_rc = laplacian[r, c]
-                val_at_cr = laplacian[c, r]
-                hermitian_conjugate_at_rc = laplacian.getH()[r, c]
-
-                error_messages.append(
-                    f"  Mismatch at ({r}, {c}): L[{r},{c}] = {val_at_rc} | L_H[{r},{c}] = {hermitian_conjugate_at_rc} "
-                    f"(Note: L[{c},{r}] = {val_at_cr})"
-                )
-
-            full_error_msg = (
-                "Laplacian matrix is not Hermitian. Mismatches found at the following locations:\n" +
-                "\n".join(error_messages) +
-                "\nTotal non-Hermitian entries: " + str(hermitian_check.nnz)
-            )
-            raise ValueError(full_error_msg)
+                    # Periodic edge - store for later phase factor application
+                    periodic_edges.append([i, j, periodic_offset])  
+                    # Also store the reverse edge
+                    reverse_offset = (-periodic_offset[0], -periodic_offset[1])
+                    periodic_edges.append([j, i, reverse_offset])
+        #more efficient construction in coo_matrix
+        laplacian_coo = coo_matrix((data, (row_indices, col_indices)),shape=(n, n), dtype=complex)
+        #manipulation is better in csr 
+        laplacian = laplacian_coo.tocsr()
+        if not self._is_hermitian_sparse(laplacian):
+            raise ValueError("Laplacian matrix is not Hermitian.")
+    
+        logger.info(f"Matrix construction: {n}×{n}, {len(periodic_edges)} periodic edges")
+        logger.info(f"Matrix density: {laplacian.nnz / (n*n) * 100:.2f}%")
         logger.info(f"Total periodic edges: {len(periodic_edges)}")
         return laplacian ,periodic_edges
-    
+    def _is_hermitian_sparse(self,matrix: csr_matrix, rtol: float = constants.NUMERIC_TOLERANCE) -> bool:
+        """
+        Efficiently check if sparse matrix is Hermitian.
+        
+        Args:
+            matrix: Sparse matrix to check
+            rtol: Relative tolerance for comparison
+            
+        Returns:
+            bool: True if matrix is Hermitian within tolerance
+        """
+        # For sparse matrices, this is much faster than full comparison
+        diff = matrix - matrix.getH()
+        return diff.max() < rtol and abs(diff.min()) < rtol
+
     def build_laplacian(self,inter_graph_weight:float=1.0,intra_graph_weight:float=1.0, Momentum:tuple[float,float]=[0.0,0.0],
-                        laplacian:lil_matrix=None,periodic_edges:list=None, verbosity:bool=False)->lil_matrix: 
+                        laplacian:csr_matrix=None,periodic_edges:list=None, verbosity:bool=False)->lil_matrix: 
         """
         Construct the full Laplacian matrix with periodic phase factors applied.
 
@@ -618,11 +637,21 @@ class periodic_graph(graph):
                 raise ValueError("Missing input! when providing the Laplacian one should also provide periodic edges list!")
         else:
             laplacian_copy=laplacian.copy()
-        for periodic_edge in periodic_edges:
-            phase = np.dot(periodic_edge[2], np.array(Momentum)) # Calculate the phase factor for the periodic offset and momentum in relative units.
-            laplacian_copy[periodic_edge[0],periodic_edge[1]]+= np.exp(1j*2*np.pi* phase)# Use the periodic offset to calculate the weight 
-            if verbosity:
-                logger.debug(f"Edge ({periodic_edge[0]}, {periodic_edge[1]}) += e^{phase:.3f}i to  total = {laplacian_copy[periodic_edge[0], periodic_edge[1]]}")
+        
+        # Vectorized phase factor computation
+        i_indices = np.array([edge[0] for edge in periodic_edges], dtype=int)
+        j_indices = np.array([edge[1] for edge in periodic_edges], dtype=int)
+        
+        # Handle offset tuples properly
+        offsets = np.array([[edge[2][0], edge[2][1]] for edge in periodic_edges], dtype=float)
+   
+        
+        # Vectorized phase calculation
+        phases = np.dot(offsets, np.array(Momentum)) * 2 * np.pi
+        phase_factors = np.exp(1j * phases)
+        
+        # Batch update of matrix elements
+        laplacian_copy[i_indices, j_indices] += phase_factors
         if not (laplacian_copy != laplacian_copy.getH()).nnz == 0:
             raise ValueError("Laplacian matrix is not Hermitian.")
         return laplacian_copy   
@@ -654,7 +683,7 @@ class periodic_graph(graph):
                 # Request more eigenvalues than needed for stability
                 k_request = min(num_bands + 5, Laplacian.shape[0] - 2)
                 
-                eigvals, _ = eigsh(Laplacian,k=k_request,sigma=strategy['sigma'],which=strategy['which'],maxiter=1000,tol=constants.EIGENVALUE_TOLERANCE)
+                eigvals, _ = eigsh(Laplacian,k=k_request,sigma=strategy['sigma'],which=strategy['which'],maxiter=1000,tol=constants.NUMERIC_TOLERANCE)
                 
                 # Sort and extract requested range
                 eigvals = np.sort(eigvals.real)
@@ -1002,6 +1031,7 @@ class TBG :
             self.lattice_vectors= [tuple(item * self.N for item in constants.v1), tuple(item * self.N for item in constants.v2)]
             self.dual_vectors= [tuple(item * self.N for item in constants.k1), tuple(item * self.N for item in constants.k2)]
         logger.info(f"Lattice vectors: {self.lattice_vectors}, and the duals are {self.dual_vectors}")
+
     def _connect_layers(self,interlayer_dist_threshold:float= 1.):
         """
         A subfunction to connect the two layers, using spatial indexing and vectorization.
@@ -1014,26 +1044,58 @@ class TBG :
         # If there is an empty layer- exit
         if not top_nodes or not bottom_nodes:
             return
+        
         # Create spatial index for top layer and bottom
         top_positions = np.array([node.position for node in top_nodes])
         bottom_positions = np.array([node.position for node in bottom_nodes])
+
+        #create a box around the top layer,
+        top_bbox = np.array([top_positions.min(axis=0) - interlayer_dist_threshold,
+                        top_positions.max(axis=0) + interlayer_dist_threshold])
+        # Remove the nodes that are too far in the bottom layer
+        in_bbox = ((bottom_positions >= top_bbox[0]) & 
+                (bottom_positions <= top_bbox[1])).all(axis=1)
+        #in the unlikely case of no nodes conneections:
+        if not in_bbox.any():
+            logger.info("No nodes within connection threshold - skipping interlayer connections")
+            return
+        # Work only with potentially connecting nodes
+        candidate_bottom_indices = np.where(in_bbox)[0]
+        candidate_bottom_positions = bottom_positions[candidate_bottom_indices]
+        candidate_bottom_nodes = [bottom_nodes[i] for i in candidate_bottom_indices]
+
+        logger.info(f"Filtered to {len(candidate_bottom_indices)} candidate bottom nodes "
+                f"from {len(bottom_nodes)} total")
+        
+        initial_radius = min(interlayer_dist_threshold, constants.INITIAL_RADIUS_DEFAULT)  # Don't search too far initially
+
         #create a cDkTree for efficient search
         top_tree = cKDTree(top_positions)
 
         connections_made = 0
         # Process in batches for better memory usage and progress tracking
-        batch_size = min(1000, len(bottom_nodes))
+        batch_size = min(1000, len(candidate_bottom_nodes))
 
         for batch_start in range(0, len(bottom_nodes), batch_size):
             batch_end = min(batch_start + batch_size, len(bottom_nodes))
-            batch_positions = bottom_positions[batch_start:batch_end]
+            batch_positions = candidate_bottom_positions[batch_start:batch_end]
             
             # Find all neighbors within threshold for this batch
-            neighbor_indices = top_tree.query_ball_point(batch_positions, r=interlayer_dist_threshold)
-            
+            neighbor_indices = top_tree.query_ball_point(batch_positions, r=initial_radius)
+            # If initial radius was too small, expand search
+            if initial_radius < interlayer_dist_threshold:
+                for i, neighbors in enumerate(neighbor_indices):
+                    if not neighbors:  # No neighbors found, try larger radius
+                        expanded_neighbors = top_tree.query_ball_point(
+                            batch_positions[i], r=interlayer_dist_threshold
+                        )
+                        neighbor_indices[i] = expanded_neighbors
+        
             # Process connections for this batch
             for i, neighbors in enumerate(neighbor_indices):
-                bottom_idx = batch_start + i
+                if not neighbors:
+                    continue
+                bottom_idx = candidate_bottom_indices[batch_start + i]
                 bottom_node = bottom_nodes[bottom_idx]
                 bottom_node_in_graph = self.full_graph.get_node_by_index(bottom_node.lattice_index, 1)
                 

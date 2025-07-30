@@ -12,7 +12,8 @@ MAX_ADJACENT_CELLS=1 # the number of cells taken into account
 When considering a periodic structure we only take one unit cell into account. 
 So you shouldn't have edges crossing multiple unit cell- so we limit to edges crossing a nigle unit cell.
 """
-EIGENVALUE_TOLERANCE =1e-10  # Tolerance for eigenvalue convergence
+NUMERIC_TOLERANCE =1e-10  # Tolerance for eigenvalue convergence
+INITIAL_RADIUS_DEFAULT=2.0 # an initial radius to search for neighbors when connecting the layers
 # Define standard lattice vectors for hexagonal symmetry
 v1=np.array([np.sqrt(3)/2,0.5])  # The standrad lattice vectors of triangualar lattice of graphene 
 v2=np.array([np.sqrt(3)/2,-0.5])
@@ -29,13 +30,13 @@ class simulation_parameters:
     a:  int= 5 # int, co-prime to b, a<b, pararmter for the twist
     b: int= 1# int, co-prime to a, a<b, pararmter for the twist
     unit_cell_radius_factor: int =3 # Scaling factor for the plotted unit cell radius, (positive  integer)
-    unit_cell_flag: bool=True # a flag whether to plot a unit cell or the entire graph 
+    unit_cell_flag: bool=False # a flag whether to plot a unit cell or the entire graph 
     interlayer_dist_threshold: float= 1.0 # the distance of neighbors between graphs( positive float)
     min_band: int= 1 #the index of minimal band (positive int)
-    max_band: int=3 #the index of maximal band (positive int)
-    num_of_points: int=30  #the number of smapleing points for the band (positive int)
-    inter_graph_weight: float=1.0 # the weight in the laplacian of edges between sub-graphs (float)
+    max_band: int=10 #the index of maximal band (positive int)
+    num_of_points: int=50  #the number of smapleing points for the band (positive int)
+    inter_graph_weight: float=0.5 # the weight in the laplacian of edges between sub-graphs (float)
     intra_graph_weight: float=1.0# the weight in the laplacian of edges in the graph  (float)
-    k_min: float=-0.1 #the minimal k to plot in natural unit (float)
-    k_max: float=0.1 #the maximal k to plot in natural unit (float)
+    k_min: float=-0.25 #the minimal k to plot in natural unit (float)
+    k_max: float=0.25 #the maximal k to plot in natural unit (float)
     K_flag: bool= True #a flag to know if to plot around the K point or around the orgin 

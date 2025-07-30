@@ -20,4 +20,3 @@ class TestPerformance(unittest.TestCase):
         # Should complete within 10 seconds for this size
         self.assertLess(construction_time, 10.0, 
                        f"Construction took {construction_time:.2f}s, too slow!")
-    

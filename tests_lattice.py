@@ -1,6 +1,6 @@
 import unittest
 import numpy as np
-from .. import Lattice 
+import Lattice 
 
 class TestNode(unittest.TestCase):
     """Test Lattice.Node class functionality."""

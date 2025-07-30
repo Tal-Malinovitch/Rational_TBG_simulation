@@ -1,5 +1,6 @@
 import sys
 import numpy as np
+from typing import Union
 from PyQt6.QtWidgets import *
 from PyQt6.QtGui import *
 from PyQt6.QtCore import Qt,pyqtSignal
@@ -64,7 +65,7 @@ class main_window(QMainWindow):
     Main GUI window class for simulating and visualizing
     twisted bilayer graphene (TBG) systems and their band structures.
     """
-    def __init__(self):
+    def __init__(self)->None:
         super().__init__()
         N_from_computation,_,factor,k_point=Lattice.compute_twist_constants(DEFAULT_PARAMS["a"],DEFAULT_PARAMS["b"]) 
         self.current_params = DEFAULT_PARAMS #set up the paramters
@@ -86,7 +87,7 @@ class main_window(QMainWindow):
         self.periodic_graph = self.graph.full_graph.create_periodic_copy(self.graph.lattice_vectors,k_point)  # Create a periodic copy of the full graph
         self.init_ui()
 
-    def init_ui(self):
+    def init_ui(self)->None:
         """Initializes the GUI layout and widgets."""
         
         
@@ -122,7 +123,7 @@ class main_window(QMainWindow):
         self.statusBar().showMessage('Ready')
         self.show()
 
-    def handle_param_update(self, param_dict: dict):
+    def handle_param_update(self, param_dict: dict)->None:
         """
         Update internal parameter state from GUI input and refresh plots.
 
@@ -150,7 +151,7 @@ class main_window(QMainWindow):
             self._last_rebuild_params = rebuild_slice
             self.current_params["build_laplacian_flag"]=True
 
-    def update_plot(self):
+    def update_plot(self)->None:
         """
         Recompute TBG structure and update the lattice plot.
         Handles validation errors and GUI messaging.
@@ -169,7 +170,7 @@ class main_window(QMainWindow):
 
         self.statusBar().showMessage("Graph updated", 3000)
         
-    def update_Bands(self):
+    def update_Bands(self)->None:
         """Refreshes the band structure view."""
         self.plot_band_widget.update_plot(self.periodic_graph)# and now plots it
         self.statusBar().showMessage("Bands plot updated", 3000)
@@ -192,7 +193,7 @@ class plot_bands(QWidget):
                                                       Laplacian for band
                                                       structure calculation.
     """
-    def __init__(self,Periodic_graph_obj: Lattice.periodic_graph,params: dict):
+    def __init__(self,Periodic_graph_obj: Lattice.periodic_graph,params: dict)->None:
         super().__init__()
         self.periodic_graph=Periodic_graph_obj
         self.params = params
@@ -200,23 +201,7 @@ class plot_bands(QWidget):
         self.periodic_edges_cache = {}
         self.init_ui()
 
-    def _get_cache_key(self, inter_weight:float, intra_weight:float):
-        """Create a cache key for Laplacian matrices.
-        
-        Args:
-            inter_weight- the weight between the layers, 
-
-        """
-        # Include relevant system parameters in cache key
-        return (
-            id(self.periodic_graph),  # Graph identity
-            inter_weight,
-            intra_weight,
-            len(self.periodic_graph.nodes),  # System size
-            len(self.periodic_graph.edges_list)  # Edge count
-        )
-
-    def init_ui(self):
+    def init_ui(self)->None:
         """Initializes the layout and draws the initial band plot."""
         
         self.layout = QVBoxLayout()
@@ -234,7 +219,7 @@ class plot_bands(QWidget):
         self.layout.addWidget(self.canvas)
         self.setLayout(self.layout)
 
-    def update_plot(self, Periodic_graph_obj: Lattice.periodic_graph):
+    def update_plot(self, Periodic_graph_obj: Lattice.periodic_graph)->None:
         """
         Refresh the band structure plot using an updated periodic graph.
 
@@ -282,14 +267,14 @@ class plot_graph(QWidget):
                                                       for plotting periodic
                                                       connections and unit cells.
     """
-    def __init__(self,Full_graph_obj:Lattice.graph,Periodic_graph_obj:Lattice.periodic_graph,params:dict):
+    def __init__(self,Full_graph_obj:Lattice.graph,Periodic_graph_obj:Lattice.periodic_graph,params:dict)->None:
         super().__init__()
         self.graph = Full_graph_obj
         self.periodic_graph=Periodic_graph_obj
         self.params = params
         self.init_ui()
     
-    def init_ui(self):
+    def init_ui(self)->None:
         """Initialize the layout and draw the initial graph plot."""
         self.layout = QVBoxLayout()
         self.layout.setSpacing(10)
@@ -305,7 +290,7 @@ class plot_graph(QWidget):
         self.layout.addWidget(self.canvas)
         self.setLayout(self.layout)
 
-    def update_plot(self, Full_graph_obj: Lattice.graph,Periodic_graph_obj:Lattice.periodic_graph):
+    def update_plot(self, Full_graph_obj: Lattice.graph,Periodic_graph_obj:Lattice.periodic_graph)->None:
         """
         Update the displayed graph with a new one.
 
@@ -334,11 +319,11 @@ class GraphParameter(QWidget):
 
     """
     parameter_changed = pyqtSignal(dict)
-    def __init__(self,main_window:QMainWindow):
+    def __init__(self,main_window:QMainWindow)->None:
         super().__init__()
         self.main_window=main_window
         self.init_ui()
-    def create_input(self, key:str):
+    def create_input(self, key:str)->Union[QCheckBox, QLineEdit]:
         """
         Creates the inputs lines based on the type, with the tooltips if provided. 
         Most of the lines are QlineEdit, except form the flags
@@ -356,7 +341,7 @@ class GraphParameter(QWidget):
             widget.setToolTip(tooltip)
         self.inputs[key] = widget
         return widget
-    def init_ui(self):
+    def init_ui(self)->None:
         """Initialize the input fields and layout for parameter editing."""
 
         self.inputs = {}
@@ -396,7 +381,7 @@ class GraphParameter(QWidget):
         self.setLayout(main_layout)        
         self.setWindowTitle('Tooltips')
 
-    def emit_params(self):
+    def emit_params(self)->None:
         """
         Validate and emit updated parameter values to the main window.
         

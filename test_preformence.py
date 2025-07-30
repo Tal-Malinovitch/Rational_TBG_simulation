@@ -3,7 +3,7 @@ import unittest
 import time
 import numpy as np
 import os
-from ..Lattice import TBG
+from Lattice import TBG
 
 class TestPerformance(unittest.TestCase):
     """Test performance characteristics."""

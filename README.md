@@ -108,6 +108,11 @@ periodic_graph.plot_band_structure(ax, num_of_points=20, min_band=1, max_band=5,
                                  inter_graph_weight=1.0, intra_graph_weight=1.0,
                                  K_flag=True)
 plt.show()
+
+## Running Tests
+```bash
+python -m unittest discover -v
+
 ### Troubleshooting
 
 **Common Issues:**

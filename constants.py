@@ -39,4 +39,4 @@ class simulation_parameters:
     intra_graph_weight: float=1.0# the weight in the laplacian of edges in the graph  (float)
     k_min: float=-0.25 #the minimal k to plot in natural unit (float)
     k_max: float=0.25 #the maximal k to plot in natural unit (float)
-    K_flag: bool= True #a flag to know if to plot around the K point or around the orgin 
+    K_flag: bool= True #a flag to know if to plot around the K point or around the origin 

@@ -415,12 +415,11 @@ class GraphParameter(QWidget):
         param_dict["N"],_,param_dict["factor"],param_dict["k_point"]=Lattice.compute_twist_constants(param_dict["a"],param_dict["b"]) 
         self.parameter_changed.emit(param_dict)
 
-
 def main():
-    """Run the Qt application for TBG visualization."""
-
+    
     app = QApplication(sys.argv)
     ex = main_window()
     sys.exit(app.exec())
-
 main()
+# main_Dirac()
+# main_diagnostic()

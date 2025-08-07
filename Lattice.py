@@ -525,7 +525,7 @@ class periodic_graph(graph):
 
         Args:
             lattice_vectors (list): Real space primitive vectors of the unit cell.
-            dual_vectors (list): Reciprocal space basis vectors.
+            dual_vectors (list): Reciprocal space basis vectors in carteasian coordinate.
             K_point (tuple): The lattice coordinates f the K point that will be used for the band computations.  
         """
         super().__init__()
@@ -620,7 +620,7 @@ class periodic_graph(graph):
         Args:
             inter_graph_weight (float): Weight of inter-subgraph connections.
             intra_graph_weight (float): Weight of intra-subgraph connections.
-            Momentum (list): 2D quasimomentum vector for phase factor calculation.
+            Momentum (list): 2D quasimomentum vector for phase factor calculation should be in realtice coordintates.
             laplacian (scipy.sparse matrix, optional): Precomputed base Laplacian.
             periodic_edges (list, optional): List of periodic edges (i, j, shift).
             verbosity (bool):  If true, log more infomation for debugging. 
@@ -666,7 +666,6 @@ class periodic_graph(graph):
             np.ndarray: Sorted list of computed eigenvalues.
 
         """
-        num_bands=max_bands-min_bands+1
         strategies = [
             # Strategy 1: Shift-invert around zero
             {'sigma': 0.0, 'which': 'LM'},
@@ -681,7 +680,7 @@ class periodic_graph(graph):
                 logger.debug(f"Trying sparse strategy {i+1}: {strategy}")
                 
                 # Request more eigenvalues than needed for stability
-                k_request = min(num_bands + 5, Laplacian.shape[0] - 2)
+                k_request = min(max_bands + 5, Laplacian.shape[0] - 2)
                 
                 eigvals, _ = eigsh(Laplacian,k=k_request,sigma=strategy['sigma'],which=strategy['which'],maxiter=1000,tol=constants.NUMERIC_TOLERANCE)
                 
@@ -1013,10 +1012,9 @@ class TBG :
         self.b=b
         self.N, self.alpha,self.factor,_ = compute_twist_constants(self.a, self.b) # Calculate the constants N and alpha for the rational TBG angle
         logger.info(f"Calculated N: {self.N}, alpha: {self.alpha} for a={self.a}, b={self.b}")
-        self.lattice_vectors=[constants.v1,constants.v2]
-        self.top_layer=hex_lattice(maxsize_n, maxsize_m,unit_cell_radius_factor*self.factor*self.N,self.lattice_vectors) # create the top layer of the TBG
+        self.top_layer=hex_lattice(maxsize_n, maxsize_m,unit_cell_radius_factor*self.factor*self.N,[constants.v1,constants.v2]) # create the top layer of the TBG
         self.top_layer.rotate_rational_TBG(self.a, self.b,self.N,self.alpha)
-        self.bottom_layer=hex_lattice(maxsize_n, maxsize_m,unit_cell_radius_factor*self.factor*self.N,self.lattice_vectors) # create the bottom layer of the TBG
+        self.bottom_layer=hex_lattice(maxsize_n, maxsize_m,unit_cell_radius_factor*self.factor*self.N,[constants.v1,constants.v2]) # create the bottom layer of the TBG
         self.bottom_layer.rotate_rational_TBG(self.a, -self.b,self.N,self.alpha)
 
         self.full_graph =self.top_layer.graph.copy(0) # Create a copy of the top layer graph
@@ -1026,10 +1024,10 @@ class TBG :
 
         if self.a%3==0: # Calculate the primitive vectors of the TBG structure,
             self.lattice_vectors= [tuple(item * self.N for item in constants.k1), tuple(item * self.N for item in constants.k2)]
-            self.dual_vectors= [tuple(item * self.N for item in constants.v1), tuple(item * self.N for item in constants.v2)]
+            self.dual_vectors= [tuple(item / self.N for item in constants.v1), tuple(item / self.N for item in constants.v2)]
         else: # If a is not a multiple of 3, use the hexagonal lattice vectors and the duals are  the regular duals
             self.lattice_vectors= [tuple(item * self.N for item in constants.v1), tuple(item * self.N for item in constants.v2)]
-            self.dual_vectors= [tuple(item * self.N for item in constants.k1), tuple(item * self.N for item in constants.k2)]
+            self.dual_vectors= [tuple(item / self.N for item in constants.k1), tuple(item / self.N for item in constants.k2)]
         logger.info(f"Lattice vectors: {self.lattice_vectors}, and the duals are {self.dual_vectors}")
 
     def _connect_layers(self,interlayer_dist_threshold:float= 1.):

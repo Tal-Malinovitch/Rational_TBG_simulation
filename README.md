@@ -292,23 +292,26 @@ python -m unittest discover Tests -v
 
 ---
 
-## 📈 Performance Benchmarks
+## 📈 Performance Analysis Framework
 
-### Computation Speed (typical system: a=5, b=1)
-- **Direct Physics Calculation**: ~2.5 seconds
-- **Neural Network Prediction**: ~25 milliseconds  
-- **Acceleration Factor**: ~100x speedup
+### Built-in Benchmarking Tools
+The framework includes comprehensive performance measurement capabilities:
+- **Timing Analysis**: Automatic measurement of physics calculation vs. neural network prediction times
+- **Memory Profiling**: System resource usage tracking for different TBG configurations
+- **Accuracy Validation**: Physics-based validation of neural network predictions
+- **Scalability Testing**: Performance analysis across varying system sizes
 
-### Memory Usage
-- **Small TBG System** (n=10): ~500 MB
-- **Medium TBG System** (n=20): ~2 GB
-- **Large TBG System** (n=50): ~12 GB
+### System Requirements & Scaling
+- **Small TBG Systems** (a,b ≤ 7): 4-8 GB RAM, moderate computation time
+- **Medium TBG Systems** (7 < a,b ≤ 13): 8-16 GB RAM, extended computation time
+- **Large TBG Systems** (a,b > 13): 16+ GB RAM, significant computation time
 
-### Accuracy Metrics
-- **K-point Prediction Error**: < 0.1% (typical)
-- **Velocity Prediction Error**: < 2% (typical)
-- **Physics Loss Convergence**: 10⁻⁶ (achievable)
+### Benchmarking Methodology
+- **Physics Baseline**: Direct eigenvalue computation with sparse matrix methods
+- **NN Prediction**: Forward pass through trained network with preprocessing
+- **Validation**: Cross-validation against physics calculations for accuracy assessment
 
+*Detailed performance results will be published as training and validation are complete.*
 ---
 
 ## 🛠️ Troubleshooting
@@ -490,3 +493,4 @@ Rice University
 *Framework Version: 2.1.0*
 
 *Documentation Status: ✅ Complete with comprehensive type hints and professional docstrings*
+

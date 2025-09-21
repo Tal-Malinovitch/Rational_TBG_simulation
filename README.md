@@ -189,14 +189,17 @@ The neural network system uses a modular architecture with specialized component
 
 ### Training Strategy
 1. **Data Pretraining**: Learn general patterns from historical Dirac point calculations
-2. **Physics Fine-tuning**: Optimize using physics-based loss function for specific parameters
+2. **Physics Fine-tuning**: Optimize using a physics-based loss function for specific parameters
 3. **Early Stopping**: Prevent overfitting with validation loss monitoring
 4. **Learning Rate Decay**: Adaptive learning rate based on training progress
 
-### Performance
-- **Speed**: 10-100x faster than direct physics calculations
-- **Accuracy**: Sub-percent error on Dirac point coordinates
-- **Scalability**: Handles systems with 10,000+ nodes efficiently
+### Performance Goals & Capabilities
+- **Speed Target**: Designed to significantly accelerate Dirac point calculations vs. direct physics methods
+- **Prediction Accuracy**: Framework optimized for high-precision k-point and velocity predictions
+- **Scalability**: Efficiently handles large TBG systems with thousands of nodes
+- **Benchmarking**: Built-in performance analysis tools for measuring acceleration factors
+
+*Note: Comprehensive performance benchmarks will be updated as training progresses and validation completes.*
 
 ---
 
@@ -485,4 +488,5 @@ Rice University
 
 *Last Updated: September 2025*
 *Framework Version: 2.1.0*
+
 *Documentation Status: ✅ Complete with comprehensive type hints and professional docstrings*

@@ -66,11 +66,12 @@ class statistics():
     def __init__(self) -> None:
         """Initialize empty statistics collection."""
         self.combination_times: List[float] = []
-        self.intersection_times: List[float] = []        
+        self.intersection_times: List[float] = []
         self.dirac_times: List[float] = []
         self.system_size_times: DefaultDict[int, List[float]] = defaultdict(list)
         self.n_scale_times: DefaultDict[float, List[float]] = defaultdict(list)
         self.start_time: Optional[float] = None
+        self.elapsed_time_before_resume: float = 0.0  # Cumulative time from previous sessions
         self.total_combinations: int = 0
         self.successful_combinations: int = 0
         self.successful_combinations_num_of_Dirac: int = 0
@@ -106,14 +107,16 @@ class statistics():
     def log_statistics(self) -> None:
         """
         Log comprehensive timing statistics to console.
-        
+
         Prints summary statistics including total runtime, success rates,
         and detailed breakdowns by system size and N_scale parameters.
         """
-        if not self.combination_times:      
+        if not self.combination_times:
             return
-        total_time = time.time() -self.start_time if self.start_time else 0
-        avg_time =sum(self.combination_times) /len(self.combination_times)
+        # Calculate cumulative total time: previous sessions + current session
+        current_session_time = time.time() - self.start_time if self.start_time else 0
+        total_time = self.elapsed_time_before_resume + current_session_time
+        avg_time = sum(self.combination_times) / len(self.combination_times)
 
         logging.info(f"\n=== TIMING STATISTICS ===")
         logging.info(f"Total runtime:{total_time/3600:.1f} hours")
@@ -153,11 +156,12 @@ class statistics():
         if not self.combination_times:
             logging.warning("No timing data to save")
             return
-        
 
-        
-        # Prepare summary statistics
-        total_time = time.time() - self.start_time if self.start_time else 0
+
+
+        # Prepare summary statistics - calculate cumulative total time
+        current_session_time = time.time() - self.start_time if self.start_time else 0
+        total_time = self.elapsed_time_before_resume + current_session_time
         avg_time = sum(self.combination_times) / len(self.combination_times)
         
         # Create detailed data for CSV
@@ -224,6 +228,7 @@ class statistics():
         self.system_size_times.clear()
         self.n_scale_times.clear()
         self.start_time = None
+        self.elapsed_time_before_resume = 0.0
         self.total_combinations = 0
         self.successful_combinations = 0
         self.successful_combinations_num_of_Dirac = 0

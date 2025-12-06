@@ -172,36 +172,40 @@ def log_bounded_activation_der(x: Union[float, np.ndarray]) -> Union[float, np.n
 
 def wrapped_k_activation(x: Union[float, np.ndarray]) -> Union[float, np.ndarray]:
     """
-    Wrapped activation function for k-points in Brillouin zone.
-    
-    Applies ReLU followed by modular wrapping to [-0.5, 0.5] range.
-    
+    Tanh-based activation function for k-points in Brillouin zone with wrapping.
+
+    Uses full tanh range [-1, 1] then applies modulo wrapping to [-0.5, 0.5].
+    This prevents gradient death at boundaries - if network predicts k=-0.6,
+    it wraps to +0.4, and gradients still flow since tanh(-0.6) is not saturated.
+
     Args:
         x (Union[float, np.ndarray]): Input value(s) to apply activation.
-        
+
     Returns:
-        Union[float, np.ndarray]: Wrapped k-point values in canonical range.
+        Union[float, np.ndarray]: k-point values in [-0.5, 0.5] range.
     """
-    # First apply leaky ReLU to prevent dead neurons
-    activated = leaky_relu(x)
-    # Then wrap to [-0.5, 0.5] range (canonical Brillouin zone)
-    return ((activated + 0.5) % 1.0) - 0.5
+    # Full tanh output: [-1, 1]
+    raw = np.tanh(x)
+    # Wrap to [-0.5, 0.5] using modulo: (value + 0.5) % 1.0 - 0.5
+    return (raw + 0.5) % 1.0 - 0.5
 
 
 def wrapped_k_activation_der(x: Union[float, np.ndarray]) -> Union[float, np.ndarray]:
     """
-    Derivative of wrapped k-point activation function.
-    
-    Since wrapping preserves derivatives (modular arithmetic), 
-    this is just the leaky ReLU derivative.
-    
+    Derivative of wrapped tanh k-point activation function.
+
+    The wrapping operation (x + 0.5) % 1.0 - 0.5 is piecewise linear with gradient 1
+    almost everywhere (discontinuity at boundaries is measure-zero). Therefore, the
+    derivative is simply the standard tanh derivative: sech²(x) = 1 - tanh²(x).
+
     Args:
         x (Union[float, np.ndarray]): Input value(s) at which to evaluate derivative.
-        
+
     Returns:
-        Union[float, np.ndarray]: 1 if x > 0, 0.01 otherwise (leaky ReLU derivative)
+        Union[float, np.ndarray]: Derivative value(s)
     """
-    return leaky_relu_der(x)
+    tanh_x = np.tanh(x)
+    return 1.0 - tanh_x**2
 
 
 class dummy_neuron:
@@ -235,7 +239,7 @@ class dummy_neuron:
 class neuron:
     """
     A computational neuron that applies an activation function to weighted inputs.
-    
+
     Attributes:
         position (np.ndarray): 2D position (i, layer_index) of the neuron in the network.
         activation_function (Callable): Function to apply to the weighted sum of inputs.
@@ -243,18 +247,22 @@ class neuron:
         inputs (List[Tuple["neuron", float]]): List of (input_neuron, weight) pairs.
         output (Optional[Any]): Current output value of the neuron.
         sum (float): Weighted sum of inputs before activation.
+        bias (float): Bias term added to weighted sum.
         Adam_corrector (List[gradient_decent_adam]): ADAM optimizers for each input weight.
+        bias_adam (Optional[gradient_decent_adam]): ADAM optimizer for bias term.
     """
-    def __init__(self, position: Tuple[int, int], activation_function: Callable, 
-                 activation_function_der: Callable, output: Optional[Any] = None) -> None:
+    def __init__(self, position: Tuple[int, int], activation_function: Callable,
+                 activation_function_der: Callable, output: Optional[Any] = None,
+                 initial_bias: Optional[float] = None) -> None:
         """
         Initialize a computational neuron.
-        
+
         Args:
             position (Tuple[int, int]): Position (neuron_index, layer_index) in the network.
             activation_function (Callable): Activation function to apply to inputs.
             activation_function_der (Callable): Derivative of the activation function.
             output (Optional[Any], optional): Initial output value. Defaults to None.
+            initial_bias (Optional[float], optional): Initial bias value. If None, uses random initialization.
         """
         self.position = np.array(position)
         self.activation_function = activation_function
@@ -262,27 +270,46 @@ class neuron:
         self.inputs = []
         self.output = output
         self.sum = 0
+        # Initialize bias: use provided value or zero for hidden layers
+        if initial_bias is not None:
+            self.bias = initial_bias
+        else:
+            # Zero initialization for hidden layers (weights already break symmetry)
+            # Random biases interfere with smart output bias initialization
+            self.bias = 0.0
         self.Adam_corrector = []
+        self.bias_adam = None  # Initialized when first weight is connected
 
     def connect_input(self, other_neuron: "neuron", weight: float) -> None:
         """
         Connect another neuron as an input to this neuron with a specified weight.
-        
+
         Args:
             other_neuron (neuron): The neuron to connect as input.
             weight (float): The connection weight between neurons.
         """
         self.inputs.append((other_neuron, weight))
-        self.Adam_corrector.append(gradient_decent_adam(initial_weight=weight))
+        weight_adam = gradient_decent_adam(initial_weight=weight)
+        self.Adam_corrector.append(weight_adam)
+
+        # Initialize bias ADAM optimizer with same hyperparameters as weight optimizer
+        if self.bias_adam is None:
+            self.bias_adam = gradient_decent_adam(
+                alpha=weight_adam.alpha,
+                beta_1=weight_adam.beta_1,
+                beta_2=weight_adam.beta_2,
+                eps=weight_adam.eps,
+                initial_weight=self.bias
+            )
 
     def compute(self) -> None:
         """
-        Compute the neuron's output by applying activation function to weighted inputs.
-        Updates self.sum with the weighted sum and self.output with the activated result.
+        Compute the neuron's output by applying activation function to weighted inputs plus bias.
+        Updates self.sum with the weighted sum + bias, and self.output with the activated result.
         """
         if not self.inputs:
             return
-        self.sum = sum(weight * other_neuron.output for other_neuron, weight in self.inputs)
+        self.sum = sum(weight * other_neuron.output for other_neuron, weight in self.inputs) + self.bias
         self.output = self.activation_function(self.sum)
 
     def derivative(self, other_neuron: "neuron") -> float:
@@ -304,7 +331,7 @@ class neuron:
     def change_weight(self, other_neuron: "neuron", new_weight: float) -> None:
         """
         Update the connection weight to a specific input neuron.
-        
+
         Args:
             other_neuron (neuron): The input neuron whose connection weight to update.
             new_weight (float): The new weight value for the connection.
@@ -314,15 +341,27 @@ class neuron:
                 self.inputs[i] = (neuron, new_weight)
                 break
 
+    def update_bias(self, bias_gradient: float) -> None:
+        """
+        Update bias using ADAM optimizer.
+
+        Args:
+            bias_gradient (float): Gradient of loss with respect to bias
+        """
+        if self.bias_adam is not None:
+            self.bias_adam.update(bias_gradient)
+            self.bias = self.bias_adam.weight
+
 
 class layer:
     """
     A layer of neurons in the neural network.
-    
+
     Attributes:
         index_layer (int): Index of this layer in the network.
         num_neurons (int): Number of neurons in this layer.
-        Jacobian (List[np.ndarray]): Jacobian matrix rows for backpropagation.
+        Jacobian (List[np.ndarray]): Jacobian matrix rows for backpropagation (weight gradients).
+        bias_gradients (np.ndarray): Gradient vector for bias terms.
         neurons (List[Union[neuron, dummy_neuron]]): List of neurons in this layer.
         activation_function (Optional[Callable]): Activation function for this layer.
         activation_function_der (Optional[Callable]): Derivative of activation function.
@@ -334,20 +373,21 @@ class layer:
                  output: Optional[List[Any]] = None) -> None:
         """
         Initialize a layer with the specified number of neurons.
-        
+
         Args:
             num_neurons (int): Number of neurons to create in this layer.
             activation_function (Optional[Callable], optional): Activation function for neurons.
             activation_function_der (Optional[Callable], optional): Derivative of activation function.
             index_layer (int, optional): Index of this layer in the network. Defaults to 0.
             output (Optional[List[Any]], optional): Fixed outputs for dummy layer. Defaults to None.
-            
+
         Raises:
             ValueError: If output length doesn't match num_neurons for input layer.
         """
         self.index_layer = index_layer
         self.num_neurons = num_neurons
         self.Jacobian = []
+        self.bias_gradients = np.zeros(num_neurons)
         
         if output is not None:
             if len(output) != num_neurons:
@@ -424,16 +464,21 @@ class layer:
 
     def update_weights(self) -> None:
         """
-        Update connection weights using ADAM optimizer.
+        Update connection weights and biases using ADAM optimizer.
         Only applies to non-dummy layers.
         """
         if self.Dummy:
             return
-        
+
         for i, neuron in enumerate(self.neurons):
+            # Update connection weights
             for j, input in enumerate(neuron.inputs):
                 neuron.Adam_corrector[j].update(self.Jacobian[i][j])  # compute the new weight
-                neuron.change_weight(input[0], neuron.Adam_corrector[j].weight)  # FIXED: input[0] is the neuron 
+                neuron.change_weight(input[0], neuron.Adam_corrector[j].weight)  # FIXED: input[0] is the neuron
+
+            # Update bias
+            if i < len(self.bias_gradients):
+                neuron.update_bias(self.bias_gradients[i]) 
 
     def backward(self) -> Tuple[np.ndarray, np.ndarray]:
         """
@@ -504,47 +549,80 @@ class neural_network:
         # Create hidden and output layers
         for index, (num_neurons, activation_function, activation_function_gradient) in enumerate(layers_structure):
             # Handle mixed activation functions for output layer
+            is_output_layer = False
             if activation_function == 'mixed_output':
                 new_layer = self._create_mixed_output_layer(num_neurons, index+1)
+                is_output_layer = True
             else:
                 new_layer = layer(num_neurons, activation_function, activation_function_gradient, index_layer=index+1)
-            
-            # Connect to the previous layer with He normal initialization BEFORE appending new layer
+
+            # Connect to the previous layer with appropriate initialization BEFORE appending new layer
             previous_layer = self.layers[index]  # index is correct since we haven't appended yet
             n_inputs = len(previous_layer.neurons)
-            
-            # He initialization for ReLU-like activations: std = sqrt(HE_FACTOR/n_inputs)
-            weights = np.random.normal(0.0, np.sqrt(constants.HE_INIT_FACTOR / n_inputs), (n_inputs, num_neurons))
-            
-            # He initialization is optimal for ReLU/Leaky ReLU to prevent gradient explosion
-            
+
+            # Use Xavier/Glorot initialization for all tanh layers: std = sqrt(1/n_inputs)
+            # Xavier prevents saturation by using smaller initial weights suitable for symmetric activations
+            # Set seed for reproducible weight initialization
+            np.random.seed(constants.WEIGHT_INIT_SEED + index)  # Different seed per layer
+            weights = np.random.normal(0.0, np.sqrt(1.0 / n_inputs), (n_inputs, num_neurons))
+            np.random.seed()  # Reset to random state for other operations
+
             previous_layer.connect_layers(new_layer, weights)
             self.layers.append(new_layer)
 
     def _create_mixed_output_layer(self, num_neurons: int, layer_index: int) -> 'layer':
         """
         Create a mixed output layer with different activation functions per neuron.
-        First 2 neurons use wrapped k-point activation, remaining use ReLU for ν output.
-        
+        First 2 neurons use wrapped k-point activation, remaining use Leaky ReLU for ν output.
+
+        Uses smart bias initialization based on training data statistics to give network
+        a good starting point and prevent outputs from collapsing to zero.
+
         Args:
             num_neurons: Number of neurons in the layer
             layer_index: Index of this layer in the network
-            
+
         Returns:
-            Layer with mixed activation functions
+            Layer with mixed activation functions and smart biases
         """
         # Create layer without specifying activation (we'll set per-neuron)
         mixed_layer = layer(num_neurons, None, None, layer_index)
-        
-        # Override the neurons with custom activation functions
+
+        # Smart bias initialization for TWO-POINT prediction
+        # Network outputs: [k_x1, k_y1, nu1, k_x2, k_y2, nu2]
+        # Initialize each point near training mean to provide good starting point
+        # For wrapped tanh: output ≈ tanh(bias) when hidden layer sum ≈ 0
+
+        k_x_bias = np.arctanh(np.clip(constants.TRAINING_K_X_MEAN, -0.99, 0.99))
+        k_y_bias = np.arctanh(np.clip(constants.TRAINING_K_Y_MEAN, -0.99, 0.99))
+        nu_bias = constants.TRAINING_NU_MEAN
+
+        # Override the neurons with custom activation functions and smart biases
         mixed_layer.neurons = []
         for i in range(num_neurons):
-            if i < 2:  # First 2 neurons are k_x, k_y - use wrapped activation
-                neuron_obj = neuron((i, layer_index), wrapped_k_activation, wrapped_k_activation_der)
-            else:  # Remaining neurons (ν = 1/(1+v)) use Leaky ReLU
-                neuron_obj = neuron((i, layer_index), leaky_relu, leaky_relu_der)
+            if i == 0:  # k_x1 neuron - first prediction
+                neuron_obj = neuron((i, layer_index), wrapped_k_activation, wrapped_k_activation_der,
+                                   initial_bias=k_x_bias)
+            elif i == 1:  # k_y1 neuron - first prediction
+                neuron_obj = neuron((i, layer_index), wrapped_k_activation, wrapped_k_activation_der,
+                                   initial_bias=k_y_bias)
+            elif i == 2:  # nu1 neuron - first prediction
+                neuron_obj = neuron((i, layer_index), leaky_relu, leaky_relu_der,
+                                   initial_bias=nu_bias)
+            elif i == 3:  # k_x2 neuron - second prediction
+                neuron_obj = neuron((i, layer_index), wrapped_k_activation, wrapped_k_activation_der,
+                                   initial_bias=k_x_bias)
+            elif i == 4:  # k_y2 neuron - second prediction
+                neuron_obj = neuron((i, layer_index), wrapped_k_activation, wrapped_k_activation_der,
+                                   initial_bias=k_y_bias)
+            else:  # nu2 neuron - second prediction (i == 5)
+                neuron_obj = neuron((i, layer_index), leaky_relu, leaky_relu_der,
+                                   initial_bias=nu_bias)
             mixed_layer.neurons.append(neuron_obj)
-        
+
+        # Initialize Jacobian list to match number of neurons
+        mixed_layer.Jacobian = [np.zeros(1) for _ in range(num_neurons)]
+
         mixed_layer.Dummy = False
         return mixed_layer
 
@@ -564,9 +642,12 @@ class neural_network:
         """
         Perform backward pass through the network using backpropagation.
         Updates Jacobian matrices for all layers based on loss function gradients.
+
+        Note: Loss function is responsible for its own weight configuration via closure/wrapper.
         """
         output = self.compute()
-        loss, gradient_vector = self.loss_function_and_grad(output, [0.6, 0.3, 0.1])  # Default weights
+        # Pass None - loss function wrapper handles its own weights
+        loss, gradient_vector = self.loss_function_and_grad(output, None)
 
         Jacobians = []
         activation_der_matrices = []
@@ -582,13 +663,52 @@ class neural_network:
         # Backpropagate gradients through the network
         current_vector = gradient_vector
         Temp_vector = current_vector * np.diag(activation_der_matrices[-1])
-        full_Jacobian = np.outer(Temp_vector,values[-2])  
-        self.layers[-1].update_Jacobian(full_Jacobian)  
+        full_Jacobian = np.outer(Temp_vector,values[-2])
+        self.layers[-1].update_Jacobian(full_Jacobian)
+        # Store bias gradients for output layer (Temp_vector before outer product with inputs)
+        self.layers[-1].bias_gradients = Temp_vector.copy()
+
         for i in range(len(Jacobians)-2, 0, -1):
             current_vector = current_vector @ Jacobians[i+1].T
             Temp_vector = current_vector * np.diag(activation_der_matrices[i])
-            full_Jacobian = (np.outer(Temp_vector,values[i-1])) 
-            self.layers[i].update_Jacobian(full_Jacobian)  
+            full_Jacobian = (np.outer(Temp_vector,values[i-1]))
+            self.layers[i].update_Jacobian(full_Jacobian)
+            # Store bias gradients for this layer
+            self.layers[i].bias_gradients = Temp_vector.copy()  
+
+    def backward_with_custom_gradients(self, gradient_vector: np.ndarray) -> None:
+        """
+        Perform backward pass with custom output gradients (e.g., for variance penalty).
+
+        Args:
+            gradient_vector: Custom gradient vector for output layer
+        """
+        Jacobians = []
+        activation_der_matrices = []
+        values = []
+
+        # Collect gradients from all layers
+        for layer in self.layers:
+            Jac_temp, values_temp = layer.backward()
+            Jacobians.append(Jac_temp)
+            activation_der_matrices.append(layer.activation_function_der_matrix)
+            values.append(values_temp)
+
+        # Backpropagate gradients through the network
+        current_vector = gradient_vector
+        Temp_vector = current_vector * np.diag(activation_der_matrices[-1])
+        full_Jacobian = np.outer(Temp_vector, values[-2])
+        self.layers[-1].update_Jacobian(full_Jacobian)
+        # Store bias gradients for output layer
+        self.layers[-1].bias_gradients = Temp_vector.copy()
+
+        for i in range(len(Jacobians)-2, 0, -1):
+            current_vector = current_vector @ Jacobians[i+1].T
+            Temp_vector = current_vector * np.diag(activation_der_matrices[i])
+            full_Jacobian = (np.outer(Temp_vector, values[i-1]))
+            self.layers[i].update_Jacobian(full_Jacobian)
+            # Store bias gradients for this layer
+            self.layers[i].bias_gradients = Temp_vector.copy()
 
     def update_weights(self) -> None:
         """

@@ -25,9 +25,9 @@ logger = logging.getLogger(__name__)
 # Default network configuration
 default_network_config = {
     'input_features': 6,  # a, b, interlayer_threshold, intralayer_threshold, inter_weight, intra_weight
-    'output_features': 3,  # k_x, k_y, velocity
-    'hidden_layer_size': constants.DEFAULT_NN_LAYER_SIZE,
-    'num_hidden_layers': 2,  # Back to 2 layers - additional layer caused worse gradient explosion
+    'output_features': 6,  # k_x1, k_y1, nu1, k_x2, k_y2, nu2 (two Dirac point predictions)
+    'hidden_layer_size': 30,  # Testing 30 neurons - middle ground between 20 (good) and 40 (collapsed)
+    'num_hidden_layers': 3,  # 3 hidden layers: 6→30→30→30→6 (~2100 params, 12x samples/param ratio)
     'unit_cell_radius_factor': constants.DEFAULT_UNIT_CELL_RADIUS_FACTOR
 }
 
@@ -94,9 +94,9 @@ class dirac_network_builder:
             if not isinstance(value, int) or value <= 0:
                 raise constants.physics_parameter_error(f"Config {key} must be positive integer, got {value}")
         
-        # Validate output features is 3 for Dirac point prediction
-        if self.network_config['output_features'] != 3:
-            raise constants.physics_parameter_error("Output features must be 3 for Dirac point prediction (k_x, k_y, velocity)")
+        # Validate output features is 6 for two-point Dirac prediction
+        if self.network_config['output_features'] != 6:
+            raise constants.physics_parameter_error("Output features must be 6 for two-point Dirac prediction (k_x1, k_y1, nu1, k_x2, k_y2, nu2)")
     
     def build_network(self) -> neural_network:
         """
@@ -119,13 +119,23 @@ class dirac_network_builder:
             
             # Define layer structure
             layers_structure = []
-            
-            # Add hidden layers with Leaky ReLU activation to prevent dead neurons
+
+            # Softsign activation functions (less prone to saturation than tanh)
+            # softsign(x) = x / (1 + |x|) → asymptotes to ±1 much more slowly than tanh
+            # At x=6: softsign=0.857 vs tanh=0.9999
+            def softsign(x):
+                return x / (1.0 + np.abs(x))
+
+            def softsign_derivative(x):
+                return 1.0 / ((1.0 + np.abs(x)) ** 2)
+
+            # Add hidden layers with softsign activation to reduce saturation cascade
+            # Softsign bounds outputs to (-1, 1) but saturates much more slowly than tanh
             for _ in range(self.network_config['num_hidden_layers']):
                 layers_structure.append((
                     self.network_config['hidden_layer_size'],
-                    leaky_relu,
-                    leaky_relu_der
+                    softsign,
+                    softsign_derivative
                 ))
             
             # Add mixed output layer
@@ -309,23 +319,39 @@ class dirac_network_builder:
             logger.error(f"Failed to set network parameters: {str(e)}")
             raise constants.physics_parameter_error(f"Parameter setting failed: {str(e)}")
     
+    def set_network_inputs_only(self, params: List[Union[int, float]]) -> None:
+        """
+        Set network inputs directly without initializing TBG graphs.
+
+        Use this for NN-only predictions where you don't need physics validation.
+        This allows testing non-coprime pairs for scale invariance testing.
+
+        Args:
+            params (List[Union[int, float]]): TBG parameters [a, b, ...]
+        """
+        if self.current_network is None:
+            raise constants.physics_parameter_error("No network built. Call build_network() first.")
+
+        self._set_network_inputs(np.array(params))
+        logger.debug(f"Set network inputs only (no graph construction): a={params[0]}, b={params[1]}")
+
     def _set_network_inputs(self, input_values: np.ndarray) -> None:
         """
         Set input layer values in the neural network with input transformations.
-        
+
         Transforms (a, b) → (1/a, 1/b) for better numerical scaling.
-        
+
         Args:
             input_values (np.ndarray): Input parameter values
-            
+
         Raises:
             constants.matrix_operation_error: If input dimensions don't match
         """
         if self.current_network is None:
             raise constants.physics_parameter_error("No network available")
-        
+
         input_layer = self.current_network.layers[0]
-        
+
         if len(input_values) != len(input_layer.neurons):
             raise constants.matrix_operation_error(
                 f"Input size mismatch: got {len(input_values)}, expected {len(input_layer.neurons)}"

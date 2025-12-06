@@ -112,22 +112,31 @@ class gradient_decent_adam():
 
 def _adam_optimize_k_point(initial_k: Tuple[float, float],periodic_graph: periodic_graph,
                             compute_metrics_fn: Callable[[List[float]], Tuple[float, float, float, float]],
-                            convergence_threshold: float, max_iterations: int, 
+                            convergence_threshold: float, max_iterations: int,
                             learning_rate: float = constants.ADAM_LEARNING_RATE,weights: List[float]=None) -> Tuple[Tuple[float, float], float]:
     """
     Generic ADAM optimization for k-point finding.
-    
+
+    Implements adaptive metric weighting for Dirac point finding to avoid wasting iterations
+    on irrelevant convergence steps. When using full metric weights (gap + R² + isotropy),
+    the optimizer automatically starts with gap-only optimization and switches to full metrics
+    once gap < GAP_THRESHOLD_FOR_REFINEMENT. This mimics the two-phase approach used in
+    training data generation (intersection finding → Dirac refinement).
+
     Args:
         initial_k (Tuple[float, float]): Starting k-point coordinates [k_1, k_2]
-        compute_metrics_fn (Callable): Function that computes (metric, grad_k_1, grad_k_2, target_value)
-            Takes k_point as List[float] and returns the metric to minimize, gradients, and target value
-        convergence_threshold (float): Stopping criterion - optimization stops when metric < threshold  
+        compute_metrics_fn (Callable): Function that computes (metric, grad_k_1, grad_k_2, target_value[, raw_metrics])
+            Takes k_point as List[float] and returns the metric to minimize, gradients, and target value.
+            If returns 5 elements, last element is raw_metrics=[gap, R2, isotropy] for adaptive weighting.
+        convergence_threshold (float): Stopping criterion - optimization stops when metric < threshold
         max_iterations (int): Maximum number of iterations before giving up
         learning_rate (float, optional): ADAM learning rate. Defaults to constants.ADAM_LEARNING_RATE.
-        
+        weights (List[float], optional): Metric weights [gap, R2, isotropy]. If equals DEFAULT_NN_LOSS_WEIGHTS
+            and compute_metrics_fn returns raw metrics, adaptive weighting is automatically enabled.
+
     Returns:
         Tuple[Tuple[float, float], float]: Tuple of (optimized_k_point, final_target_value)
-        
+
     Raises:
         ValueError: If optimization fails to converge within max_iterations
     """
@@ -135,21 +144,53 @@ def _adam_optimize_k_point(initial_k: Tuple[float, float],periodic_graph: period
     adam_k_1 = gradient_decent_adam(alpha=learning_rate, initial_weight=k_1)
     adam_k_2 = gradient_decent_adam(alpha=learning_rate, initial_weight=k_2)
     prev_metric = 0
-    
+
+    # Track best point found so far
+    best_k = (k_1, k_2)
+    best_metric = float('inf')
+    best_target_value = 0
+
+    # Adaptive weighting: detect if we should use gap-only initially
+    # Only enable if weights match DEFAULT_NN_LOSS_WEIGHTS (Dirac point finding, not intersection finding)
+    use_adaptive_weights = (weights is not None and
+                           np.allclose(weights, constants.DEFAULT_NN_LOSS_WEIGHTS))
+    current_weights = constants.GAP_ONLY_WEIGHTS if use_adaptive_weights else weights
+    refinement_phase = False  # Track when we switch to full metric
+
     for iteration in range(max_iterations):
         if weights is None:
-            metrics, grad_k_1, grad_k_2, target_value = compute_metrics_fn((k_1, k_2),periodic_graph)
+            result = compute_metrics_fn((k_1, k_2),periodic_graph)
+            metrics, grad_k_1, grad_k_2, target_value = result[0], result[1], result[2], result[3]
         else:
-            metrics, grad_k_1, grad_k_2, target_value = compute_metrics_fn((k_1, k_2),periodic_graph,weights)
-        
+            result = compute_metrics_fn((k_1, k_2),periodic_graph,current_weights)
+            metrics, grad_k_1, grad_k_2, target_value = result[0], result[1], result[2], result[3]
+
+            # Adaptive weighting: switch from gap-only to full metric when gap is small
+            if use_adaptive_weights and not refinement_phase and len(result) > 4:
+                raw_metrics = result[4]  # [gap, R2_loss, isotropy_loss]
+                gap = raw_metrics[0]
+
+                if gap < constants.GAP_THRESHOLD_FOR_REFINEMENT:
+                    current_weights = weights  # Switch to full metric
+                    refinement_phase = True
+                    # Recompute metrics with new weights for this iteration
+                    result = compute_metrics_fn((k_1, k_2),periodic_graph,current_weights)
+                    metrics, grad_k_1, grad_k_2, target_value = result[0], result[1], result[2], result[3]
+
+        # Track best point found so far
+        if metrics < best_metric:
+            best_metric = metrics
+            best_k = (k_1, k_2)
+            best_target_value = target_value
+
         # Check convergence
         if metrics < convergence_threshold:
             k_1 = (k_1 + 0.5) % 1.0 - 0.5
-            k_2 = (k_2 + 0.5) % 1.0 - 0.5  
+            k_2 = (k_2 + 0.5) % 1.0 - 0.5
             logging.debug(f"Converged at Iter {iteration:2d}: metric={metrics:.6f} "
                          f"k=({k_1:.4f},{k_2:.4f})")
             return (k_1, k_2), target_value
-            
+
         # Adaptive learning rate - reduce if significant improvement
         if iteration > 0 and metrics < prev_metric * constants.IMPROVEMENT_THRESHOLD:
             adam_k_1.alpha *= constants.LEARNING_RATE_REDUCTION_FACTOR
@@ -157,26 +198,30 @@ def _adam_optimize_k_point(initial_k: Tuple[float, float],periodic_graph: period
             # Reset momentum
             adam_k_1.current_m = adam_k_1.current_v = 0
             adam_k_2.current_m = adam_k_2.current_v = 0
-            
+
         # Update positions using ADAM
         adam_k_1.update(grad_k_1)
         adam_k_2.update(grad_k_2)
-        
+
         k_1 += adam_k_1.weight
         k_2 += adam_k_2.weight
-        
+
         # Wrap coordinates to unit cell
         k_1 = (k_1 + 0.5) % 1.0 - 0.5
         k_2 = (k_2 + 0.5) % 1.0 - 0.5
-        
+
         # Reset ADAM weights for next iteration
         adam_k_1.weight = adam_k_2.weight = 0
         prev_metric = metrics
-        
+
         logging.debug(f"Iter {iteration:2d}: metric={metrics:.6f} grad_norm={np.linalg.norm([grad_k_1, grad_k_2]):.4f} "
                      f"k=({k_1:.4f},{k_2:.4f}) lr=({adam_k_1.alpha:.1e},{adam_k_2.alpha:.1e})")
-        
-    raise ValueError(f"Failed to converge after {max_iterations} iterations, final metric: {metrics:.6f}")
+
+    # Return best point found even if convergence threshold not met
+    # Wrap best coordinates to unit cell
+    best_k_wrapped = ((best_k[0] + 0.5) % 1.0 - 0.5, (best_k[1] + 0.5) % 1.0 - 0.5)
+    logging.warning(f"Did not fully converge after {max_iterations} iterations (best metric: {best_metric:.6f} > threshold: {convergence_threshold:.6f}), returning best point found")
+    return best_k_wrapped, best_target_value
 def compute_gap_metrics(k_point: List[float],periodic_graph: periodic_graph) -> Tuple[float, float, float, float]:
     """
     Compute band gap and gradients for intersection point finding.
@@ -234,47 +279,58 @@ def find_intersection_point(initial_k: List[float], periodic_graph: periodic_gra
     return _adam_optimize_k_point(tuple(initial_k),periodic_graph, compute_gap_metrics, 
         constants.DEFAULT_E_TOLERANCE, max_num_of_iterations,constants.ADAM_LEARNING_RATE)
 def compute_loss_metrics(k_point: List[float],
-                         periodic_graph: periodic_graph,weights: List[float],) -> Tuple[float, float, float, float]:
+                         periodic_graph: periodic_graph,weights: List[float],) -> Tuple[float, float, float, float, List[float]]:
         """
         Compute loss function and gradients for Dirac point finding.
-        
+
         Args:
             k_point (List[float]): K-point coordinates [k_1, k_2]
             periodic_graph (periodic_graph): Periodic graph object for TBG system.
-            
+            weights (List[float]): Weights for combining metrics [gap, R2, isotropy]
+
         Returns:
-            Tuple[float, float, float, float]: (loss, grad_k_1, grad_k_2, dirac_velocity)
+            Tuple[float, float, float, float, List[float]]: (loss, grad_k_1, grad_k_2, dirac_velocity, raw_metrics)
+                where raw_metrics = [gap, R2_loss, isotropy_loss] for adaptive weighting
         """
         dirac_analyzer = Dirac_analysis(periodic_graph)
         metrics, metrics_der_k_1, metrics_der_k_2, mu_v, _ = dirac_analyzer.check_Dirac_point(k_point, 1)
-        
+
         loss = np.sum(np.array(metrics) * np.array(weights))
         grad_k_1 = np.sum(np.array(metrics_der_k_1) * np.array(weights))
         grad_k_2 = np.sum(np.array(metrics_der_k_2) * np.array(weights))
-        
-        return loss, grad_k_1, grad_k_2, mu_v
-def Find_Dirac_point(initial_k: List[float], periodic_graph: periodic_graph, 
+
+        return loss, grad_k_1, grad_k_2, mu_v, metrics
+def Find_Dirac_point(initial_k: List[float], periodic_graph: periodic_graph,
                      weights: List[float], max_num_of_iterations: int = constants.MAX_ITERATIONS) -> Tuple[Tuple[float, float], float]:
     """
-    Find Dirac point using ADAM optimization.
-    
+    Find Dirac point using ADAM optimization with adaptive metric weighting.
+
+    When weights == DEFAULT_NN_LOSS_WEIGHTS, the optimizer automatically uses a two-phase
+    approach to avoid wasting iterations on irrelevant convergence steps:
+    - Phase 1 (gap minimization): Uses gap-only metric until gap < GAP_THRESHOLD_FOR_REFINEMENT
+    - Phase 2 (refinement): Switches to full weighted metric [gap, R², isotropy]
+
+    This mimics the successful two-phase approach used in training data generation and prevents
+    R² and isotropy metrics from providing conflicting gradients when far from the Dirac point.
+
     Args:
         initial_k (List[float]): Initial guess [k_1, k_2] in relative coordinates.
         periodic_graph (periodic_graph): Periodic graph object for TBG system.
         weights (List[float]): Loss function weights [gap, R2, isotropy].
-        max_num_of_iterations (int, optional): Maximum number of optimization iterations. 
+            If equals DEFAULT_NN_LOSS_WEIGHTS, adaptive weighting is automatically enabled.
+        max_num_of_iterations (int, optional): Maximum number of optimization iterations.
             Defaults to constants.MAX_ITERATIONS.
-        
+
     Returns:
         Tuple[Tuple[float, float], float]: Tuple containing:
             - (k_1, k_2): Coordinates of Dirac point in relative coordinates.
             - Dirac velocity at the found point.
-        
+
     Raises:
         ValueError: If optimization fails to converge after max_num_of_iterations.
     """
 
-        
+
     return _adam_optimize_k_point(tuple(initial_k), periodic_graph, compute_loss_metrics,
         constants.DEFAULT_TOLERANCE, max_num_of_iterations, constants.ADAM_LEARNING_RATE, weights)
 def find_Dirac_point_grid(center: List[float], periodic_graph: periodic_graph, 
@@ -363,20 +419,119 @@ def find_Dirac_point_grid(center: List[float], periodic_graph: periodic_graph,
 
     logging.info(f"Found {len(results_unique)} unique intersection points from {len(results)} total")
     all_dirac_points = []
+    validation_stats = {'attempted': 0, 'converged': 0, 'validated': 0, 'rejected': 0}
+
     for  result in results_unique:
+        validation_stats['attempted'] += 1
         try:
             logging.info(f"Starting at k=({result['k'][0]:.4f}, {result['k'][1]:.4f}) with loss={result['loss']:.6f}")
             result_dirac = Find_Dirac_point((result['k'][0],result['k'][1]), periodic_graph, weights,max_num_of_iteration)
+
             if result_dirac is not None:
-                all_dirac_points.append(result_dirac)
-        except ValueError:
-            logging.debug(f"Failed at finding a Dirac point from k=({result['k'][0]:.4f}, {result['k'][1]:.4f}) with loss={result['loss']:.6f}")
+                validation_stats['converged'] += 1
+                k_point, velocity = result_dirac
+
+                # VALIDATE before adding to training data (ADDED 2025-11-07)
+                is_valid, metrics = validate_dirac_point(k_point, periodic_graph, weights)
+
+                if is_valid:
+                    # Check for duplicates in final Dirac points before adding
+                    # Multiple intersection points can converge to the same Dirac point
+                    is_duplicate = False
+                    for existing_dirac in all_dirac_points:
+                        k_diff = np.linalg.norm([k_point[0] - existing_dirac[0][0],
+                                                 k_point[1] - existing_dirac[0][1]])
+                        # Also check k -> -k symmetry
+                        k_diff_sym = np.linalg.norm([k_point[0] + existing_dirac[0][0],
+                                                      k_point[1] + existing_dirac[0][1]])
+
+                        if k_diff < constants.DEFAULT_K_TOLERANCE or k_diff_sym < constants.DEFAULT_K_TOLERANCE:
+                            is_duplicate = True
+                            logging.debug(f"  -> DUPLICATE of existing Dirac point at k=({existing_dirac[0][0]:.4f}, {existing_dirac[0][1]:.4f}), skipping")
+                            break
+
+                    if not is_duplicate:
+                        all_dirac_points.append(result_dirac)
+                        validation_stats['validated'] += 1
+                        logging.info(f"  -> VALIDATED: gap={metrics['gap']:.6f}, R²={metrics['r2']:.6f}, isotropy={metrics['isotropy']:.6f}")
+                    else:
+                        validation_stats['rejected'] += 1  # Count as rejected to maintain stats accuracy
+                else:
+                    validation_stats['rejected'] += 1
+                    logging.info(f"  -> REJECTED: gap={metrics['gap']:.6f} (max={constants.MAX_GAP_THRESHOLD}), "
+                               f"R²={metrics['r2']:.6f} (max={constants.MAX_R2_THRESHOLD}), "
+                               f"isotropy={metrics['isotropy']:.6f} (max={constants.MAX_ISOTROPY_THRESHOLD})")
+
+        except ValueError as e:
+            logging.debug(f"Failed at finding a Dirac point from k=({result['k'][0]:.4f}, {result['k'][1]:.4f}): {e}")
             continue
-    logging.info(f"Found {len(all_dirac_points)} Dirac points from {len(results_unique)} total")
+
+    logging.info(f"Validation summary: {validation_stats['attempted']} attempted, "
+                f"{validation_stats['converged']} converged ({100*validation_stats['converged']/max(validation_stats['attempted'],1):.1f}%), "
+                f"{validation_stats['validated']} validated ({100*validation_stats['validated']/max(validation_stats['converged'],1):.1f}% of converged), "
+                f"{validation_stats['rejected']} rejected")
+    logging.info(f"Found {len(all_dirac_points)} HIGH-QUALITY Dirac points from {len(results_unique)} intersection points")
     if len(all_dirac_points)==0:
         raise ValueError("Failed to extract Dirac points from intersections!")
 
     return all_dirac_points
+def validate_dirac_point(k_point: Tuple[float, float], periodic_graph: periodic_graph,
+                        weights: List[float]) -> Tuple[bool, Dict[str, float]]:
+    """
+    Validate that a Dirac point meets quality thresholds.
+
+    Checks individual quality metrics (gap, R², isotropy) against strict thresholds
+    to ensure only high-quality Dirac points are saved to training data.
+
+    Args:
+        k_point: Dirac point coordinates to validate
+        periodic_graph: TBG system periodic graph
+        weights: Loss function weights [gap_weight, R2_weight, isotropy_weight]
+
+    Returns:
+        Tuple of (is_valid, metrics_dict)
+        - is_valid: True if point passes all quality thresholds
+        - metrics_dict: Dict containing gap, R2, isotropy, weighted_loss, velocity
+
+    Added: 2025-11-07 to fix training data corruption issue
+    """
+    from TBG import Dirac_analysis
+
+    # Evaluate quality metrics at the point
+    dirac_analyzer = Dirac_analysis(periodic_graph)
+    metrics, _, _, velocity, _ = dirac_analyzer.check_Dirac_point(k_point, 1)
+    gap, r2, isotropy = metrics
+
+    # Calculate weighted loss
+    weighted_loss = np.sum(np.array(metrics) * np.array(weights))
+
+    # Check against thresholds
+    gap_valid = gap < constants.MAX_GAP_THRESHOLD
+    r2_valid = r2 < constants.MAX_R2_THRESHOLD
+    isotropy_valid = isotropy < constants.MAX_ISOTROPY_THRESHOLD
+
+    is_valid = gap_valid and r2_valid and isotropy_valid
+
+    metrics_dict = {
+        'gap': gap,
+        'r2': r2,
+        'isotropy': isotropy,
+        'weighted_loss': weighted_loss,
+        'velocity': velocity,
+        'gap_valid': gap_valid,
+        'r2_valid': r2_valid,
+        'isotropy_valid': isotropy_valid
+    }
+
+    if not is_valid:
+        logging.debug(f"Point validation FAILED: gap={gap:.6f} (thresh={constants.MAX_GAP_THRESHOLD}), "
+                     f"R²={r2:.6f} (thresh={constants.MAX_R2_THRESHOLD}), "
+                     f"isotropy={isotropy:.6f} (thresh={constants.MAX_ISOTROPY_THRESHOLD})")
+    else:
+        logging.debug(f"Point validation PASSED: gap={gap:.6f}, R²={r2:.6f}, isotropy={isotropy:.6f}")
+
+    return is_valid, metrics_dict
+
 def compute_sym_factor(a: int, b: int) -> List[int]:
     """
     Computes the symmetric factors for twist angle parameters.
@@ -446,18 +601,41 @@ def _create_training_samples(a: int, b: int,interlayer_dist_threshold: float,
 def _process_tbg_system_worker(system_params: Tuple[int, int, float, float, float, List[float]]) -> Tuple[List[List[Union[int, float]]], List, List, Dict, List]:
     """
     Worker function to process one TBG system through all weight combinations.
-    
-    This function processes a single (a, b, intralayer_dist_threshold, interlayer_dist_threshold) 
+
+    This function processes a single (a, b, intralayer_dist_threshold, interlayer_dist_threshold)
     combination through all weight variations, preserving the matrix reuse optimization.
-    
+
     Args:
         system_params: Tuple containing (a, b, intralayer_dist_threshold, interlayer_dist_threshold, N_scale, weights)
-        
+
     Returns:
-        Tuple containing (training_samples, failed_cases, no_intersection_cases, system_stats, timing_data)
+        Tuple containing (system_key, training_samples, failed_cases, no_intersection_cases, system_stats, timing_data)
+        where system_key is [a, b, intralayer_threshold, interlayer_threshold]
     """
+    # CRITICAL: Set process priority to BELOW_NORMAL to prevent system freeze
+    # This ensures user applications (Chrome, etc.) get priority
+    try:
+        import psutil
+        p = psutil.Process()
+        # On Windows: BELOW_NORMAL_PRIORITY_CLASS
+        # On Unix: nice value of 10 (lower priority)
+        if constants.os.name == 'nt':  # Windows
+            p.nice(psutil.BELOW_NORMAL_PRIORITY_CLASS)
+        else:  # Unix/Linux/Mac
+            p.nice(10)
+        logging.debug(f"Worker process priority set to BELOW_NORMAL")
+    except ImportError:
+        # psutil not installed - continue without priority adjustment
+        logging.debug("psutil not available - process priority not adjusted")
+    except Exception as e:
+        # Priority setting failed - continue anyway
+        logging.debug(f"Could not set process priority: {e}")
+
     a, b, intralayer_dist_threshold, interlayer_dist_threshold, N_scale, weights = system_params
-    
+
+    # Create system identifier for checkpoint tracking
+    system_key = [a, b, round(intralayer_dist_threshold, 2), round(interlayer_dist_threshold, 2)]
+
     # Initialize worker-local variables
     training_batch = []
     failed_cases = []
@@ -589,8 +767,8 @@ def _process_tbg_system_worker(system_params: Tuple[int, int, float, float, floa
         
     except Exception as e:
         logging.error(f"Worker failed for TBG system (a={a}, b={b}): {str(e)}")
-        
-    return training_batch, failed_cases, no_intersection_cases, system_stats, timing_data
+
+    return system_key, training_batch, failed_cases, no_intersection_cases, system_stats, timing_data
 
 
 def create_training_data(batch_size: int = constants.DEFAULT_BATCH_SIZE, resume_from_checkpoint: bool = True, 
@@ -622,12 +800,44 @@ def create_training_data(batch_size: int = constants.DEFAULT_BATCH_SIZE, resume_
     total_samples_generated = 0
     failed_cases = []
     no_intersection_cases = []
-    cases_covered = []
+    # Track completed threshold-pair systems: each entry is [a, b, intralayer_threshold, interlayer_threshold]
+    # Each threshold-pair system processes 12 weight combinations (3 intra × 4 inter ratios)
+    systems_completed = []
+
     # Selective a values for strategic magic angle coverage
     # This targets specific high-value angles while minimizing computational cost
     # Gets angles down to 1.741° (very close to magic angle ~1.107°)
-    a_values = [2, 3, 4, 5, 6, 7, 13, 15]  
-    intralayer_thresholds = np.array([1.0,1.2,1.5,1.8])
+    # Updated 2025-11-10: a=2-10 only (removed 13,15 - too slow for reasonable completion time)
+    a_values = [2, 3, 4, 5, 6, 7, 8, 9, 10]
+
+    intralayer_thresholds = np.array([1.0, 1.2, 1.5, 1.8])
+
+    # Calculate total work by simulating the deduplication logic
+    # We skip (a,b) pairs whose symmetric partner was already queued
+    ab_pairs_to_process = []
+    ab_pairs_queued_for_count = []
+    for a in a_values:
+        if a == 3:
+            continue
+        for b in range(1, a):
+            if np.gcd(a, b) != 1:
+                continue
+            if [a, b] in ab_pairs_queued_for_count:
+                continue
+            ab_pairs_to_process.append([a, b])
+            sym_case = compute_sym_factor(a, b)
+            ab_pairs_queued_for_count.append([a, b])
+            ab_pairs_queued_for_count.append(sym_case)
+
+    total_unique_ab_pairs = len(ab_pairs_to_process)
+    threshold_pairs_per_ab = len(intralayer_thresholds) * 4  # 4 interlayer ratios per intralayer
+    total_threshold_systems = total_unique_ab_pairs * threshold_pairs_per_ab
+    weight_combos_per_threshold = 3 * 4  # 3 intra weights × 4 inter ratios
+    total_combinations_expected = total_threshold_systems * weight_combos_per_threshold
+
+    logging.info(f"Parameter space: {total_unique_ab_pairs} unique (a,b) pairs (after symmetric deduplication) "
+                f"× {threshold_pairs_per_ab} threshold-pair systems × {weight_combos_per_threshold} weight combinations "
+                f"= {total_combinations_expected} total full parameter combinations")
     
     # Initialize the statistics:
     stats = statistics()
@@ -638,62 +848,108 @@ def create_training_data(batch_size: int = constants.DEFAULT_BATCH_SIZE, resume_
     if resume_from_checkpoint:
         checkpoint = load_checkpoint()
         if checkpoint:
-            cases_covered = checkpoint.get('cases_covered', [])
+            systems_completed = checkpoint.get('systems_completed', [])
             stats.total_combinations = checkpoint.get('total_combinations', 0)
             total_samples_generated = checkpoint.get('total_samples_generated', 0)
-            logging.info(f"Resuming from checkpoint: {stats.total_combinations} combinations processed, {total_samples_generated} samples generated")
+
+            # Restore cumulative elapsed time (backward compatible)
+            if 'elapsed_time' in checkpoint:
+                # New checkpoint format - use saved elapsed time
+                stats.elapsed_time_before_resume = checkpoint['elapsed_time']
+            else:
+                # Old checkpoint format - estimate elapsed time from timestamp and average rate
+                # Estimate: If checkpoint was saved at timestamp T, and we have N combinations,
+                # estimate elapsed time from checkpoint timestamp relative to some baseline
+                # For safety, we'll just start from 0 and let next checkpoint capture going forward
+                stats.elapsed_time_before_resume = 0.0
+                logging.warning("Old checkpoint format detected (no elapsed_time field). "
+                              "Total runtime will be underestimated until next checkpoint save.")
+
+            progress_pct = 100.0 * stats.total_combinations / total_combinations_expected if total_combinations_expected > 0 else 0
+            logging.info(f"Resuming from checkpoint: {len(systems_completed)}/{total_threshold_systems} threshold-pair systems, "
+                        f"{stats.total_combinations}/{total_combinations_expected} full combinations ({progress_pct:.1f}%), "
+                        f"{total_samples_generated} samples generated")
     
-    # Determine number of processes
+    # Determine number of processes - reserve cores for user work AND enforce hard limit
     if num_processes is None:
-        num_processes = mp.cpu_count()
-    
+        total_cores = mp.cpu_count()
+        # Calculate based on reserved cores
+        num_processes = max(1, total_cores - constants.RESERVED_CORES)
+        # CRITICAL: Enforce maximum limit to prevent system freeze
+        # Each worker processes multiple TBG systems sequentially, so fewer workers is safer
+        num_processes = min(num_processes, constants.MAX_PARALLEL_PROCESSES)
+        logging.info(f"System has {total_cores} logical processors")
+        logging.info(f"  Reserved for user work: {constants.RESERVED_CORES} cores")
+        logging.info(f"  Maximum parallel limit: {constants.MAX_PARALLEL_PROCESSES} processes")
+        logging.info(f"  Using: {num_processes} parallel processes")
+
     logging.info(f"Using {'parallel' if use_parallel else 'sequential'} processing with {num_processes if use_parallel else 1} {'processes' if use_parallel else 'process'}")
     
     if use_parallel:
         # Parallel processing path
-        return _create_training_data_parallel(weights, cases_covered, stats, total_samples_generated, 
-                                            a_values, intralayer_thresholds, batch_size, num_processes)
+        return _create_training_data_parallel(weights, systems_completed, stats, total_samples_generated,
+                                            a_values, intralayer_thresholds, batch_size, num_processes,
+                                            total_combinations_expected, total_threshold_systems)
     else:
         # Sequential processing path (original implementation)
-        return _create_training_data_sequential(weights, cases_covered, stats, total_samples_generated, 
+        return _create_training_data_sequential(weights, systems_completed, stats, total_samples_generated,
                                                a_values, intralayer_thresholds, batch_size)
 
 
-def _create_training_data_parallel(weights: List[float], cases_covered: List, stats, total_samples_generated: int,
-                                 a_values: range, intralayer_thresholds: np.ndarray, 
-                                 batch_size: int, num_processes: int) -> int:
+def _create_training_data_parallel(weights: List[float], systems_completed: List, stats, total_samples_generated: int,
+                                 a_values: range, intralayer_thresholds: np.ndarray,
+                                 batch_size: int, num_processes: int,
+                                 total_combinations_expected: int, total_threshold_systems: int) -> int:
     """
     Parallel implementation of training data generation.
+
+    Args:
+        systems_completed: List of [a, b, intralayer_threshold, interlayer_threshold] systems that have
+                          completed all 12 weight combinations (3 intra × 4 inter ratios)
+                          Includes both original AND symmetric pairs to prevent redundant processing
     """
     # Build list of TBG system parameters to process in parallel
     system_params_list = []
-    
+    # Track (a,b) pairs we've queued (to skip symmetric duplicates during queue building)
+    ab_pairs_queued = []
+
     for a in a_values:
         # Avoid the trivial symmetry case
         if a == 3:
             continue
-            
+
         for b in range(1, a):
             if np.gcd(a, b) != 1:  # Skip non-coprime pairs
                 continue
-            if [a, b] in cases_covered:  # Skip already covered cases
+
+            # Skip if this (a,b) pair's symmetric partner was already queued
+            # This prevents processing both (a,b) and its symmetric when both are in a_values range
+            if [a, b] in ab_pairs_queued:
                 continue
-                
+
             # Compute TBG constants once per (a,b) pair
             N_scale, _, factor, k_point = compute_twist_constants(a, b)
-            
-            # Mark symmetric cases as covered
+
+            # Mark both this (a,b) and its symmetric as queued
+            # When we process (a,b), the worker generates samples for BOTH (a,b) and symmetric
             sym_case = compute_sym_factor(a, b)
-            cases_covered.append([a, b])
-            cases_covered.append(sym_case)
-            
+            ab_pairs_queued.append([a, b])
+            ab_pairs_queued.append(sym_case)
+
             for intralayer_dist_threshold in intralayer_thresholds:
                 # Use fixed ratios for better predictable coverage
                 interlayer_ratios = [0.3, 0.5, 0.7, 0.9]  # Relative to intralayer
                 interlayer_thresholds = [ratio * intralayer_dist_threshold for ratio in interlayer_ratios]
-                
+
                 for interlayer_dist_threshold in interlayer_thresholds:
-                    # Each system_params entry represents one TBG system to be processed
+                    # Check if this specific threshold-pair system was already completed
+                    # Round to avoid floating point comparison issues
+                    system_key = [a, b, round(intralayer_dist_threshold, 2), round(interlayer_dist_threshold, 2)]
+                    if system_key in systems_completed:
+                        continue
+
+                    # Each system_params entry represents one TBG threshold-pair system to be processed
+                    # The worker will process 12 weight combinations for this system
                     system_params = (a, b, intralayer_dist_threshold, interlayer_dist_threshold, N_scale, weights)
                     system_params_list.append(system_params)
     
@@ -704,50 +960,61 @@ def _create_training_data_parallel(weights: List[float], cases_covered: List, st
     all_failed_cases = []
     all_no_intersection_cases = []
     
-    with mp.Pool(processes=num_processes) as pool:
+    # CRITICAL: Set process priority and affinity to prevent system freeze
+    # Use chunksize=1 to process one system at a time per worker (prevents overload)
+    with mp.Pool(processes=num_processes, maxtasksperchild=1) as pool:
         # Process systems in parallel and get results as they complete
-        results_iterator = pool.imap_unordered(_process_tbg_system_worker, system_params_list)
+        # chunksize=1 ensures smooth distribution and prevents worker overload
+        results_iterator = pool.imap_unordered(_process_tbg_system_worker, system_params_list, chunksize=1)
         
         # Process results as they arrive (not waiting for all to complete)
-        for worker_training_batch, worker_failed_cases, worker_no_intersection_cases, worker_stats, worker_timing_data in results_iterator:
+        for system_key, worker_training_batch, worker_failed_cases, worker_no_intersection_cases, worker_stats, worker_timing_data in results_iterator:
             training_batch.extend(worker_training_batch)
             all_failed_cases.extend(worker_failed_cases)
             all_no_intersection_cases.extend(worker_no_intersection_cases)
-            
+
+            # Mark this threshold-pair system as completed (processed all 12 weight combinations)
+            systems_completed.append(system_key)
+
             # Update global statistics (only counts, timing data handled separately)
             stats.total_combinations += worker_stats['total_combinations']
             stats.successful_combinations += worker_stats['successful_combinations']
             stats.successful_combinations_num_of_Dirac += worker_stats['total_dirac_points']
             stats.failed_no_intersections += worker_stats['no_intersection_combinations']
-            stats.failed_no_Dirac += (worker_stats['total_combinations'] - 
-                                     worker_stats['successful_combinations'] - 
+            stats.failed_no_Dirac += (worker_stats['total_combinations'] -
+                                     worker_stats['successful_combinations'] -
                                      worker_stats['no_intersection_combinations'])
-            
+
             # Integrate worker timing data into main statistics (timing only, not counts)
             for timing_record in worker_timing_data:
                 stats.combination_times.append(timing_record['duration'])
                 stats.system_size_times[timing_record['system_size']].append(timing_record['duration'])
                 stats.n_scale_times[round(timing_record['n_scale'], 1)].append(timing_record['duration'])
-            
+
             total_samples_generated += len(worker_training_batch)
-            
+
             # Write batch to disk if it's getting large
             if len(training_batch) >= batch_size:
                 append_training_data_batch(training_batch)
-                
+
                 # Save statistics periodically (for crash recovery)
                 stats.log_statistics()
                 stats.save_statistics()
-                
+
                 # Save checkpoint with current progress
+                # systems_completed contains all threshold-pair systems that finished all 12 weight combos
+                # Calculate cumulative elapsed time for accurate resumption
+                current_session_time = time.time() - stats.start_time if stats.start_time else 0
+                cumulative_elapsed_time = stats.elapsed_time_before_resume + current_session_time
                 checkpoint_data = {
                     'total_combinations': stats.total_combinations,
                     'total_samples_generated': total_samples_generated,
-                    'cases_covered': cases_covered,
-                    'timestamp': time.time()
+                    'systems_completed': systems_completed,
+                    'elapsed_time': cumulative_elapsed_time,  # Store cumulative time, not timestamp
+                    'timestamp': time.time()  # Keep for reference, but don't use for timing calculations
                 }
                 save_checkpoint(checkpoint_data)
-                
+
                 training_batch.clear()
                 gc.collect()
     
@@ -759,15 +1026,20 @@ def _create_training_data_parallel(weights: List[float], cases_covered: List, st
     # Final statistics
     stats.log_statistics()
     stats.save_statistics()
-    
-    logging.info(f"Parallel training completed: {total_samples_generated} samples generated")
+
+    logging.info(f"=" * 60)
+    logging.info(f"DATA GENERATION COMPLETED")
+    logging.info(f"=" * 60)
+    logging.info(f"Total full parameter combinations processed: {stats.total_combinations}/{total_combinations_expected}")
+    logging.info(f"Total samples generated: {total_samples_generated}")
     logging.info(f"Failed cases: {len(all_failed_cases)}")
     logging.info(f"No intersection cases: {len(all_no_intersection_cases)}")
+    logging.info(f"=" * 60)
     
     return total_samples_generated
 
 
-def _create_training_data_sequential(weights: List[float], cases_covered: List, stats, total_samples_generated: int,
+def _create_training_data_sequential(weights: List[float], systems_completed: List, stats, total_samples_generated: int,
                                    a_values: range, intralayer_thresholds: np.ndarray, batch_size: int) -> int:
     """
     Sequential implementation of training data generation (original algorithm).
@@ -781,7 +1053,7 @@ def _create_training_data_sequential(weights: List[float], cases_covered: List, 
     raise NotImplementedError("Sequential mode not fully implemented in this refactor. Use use_parallel=True")
 
 
-def save_training_data(training_data: List[List[Union[int, float]]], filename: str = constants.PATH + "/dirac_training_data.csv") -> None:
+def save_training_data(training_data: List[List[Union[int, float]]], filename: str = constants.PATH + "/Training_data/dirac_training_data.csv") -> None:
     """
     Save training data to CSV file with appropriate headers.
     
@@ -809,7 +1081,7 @@ def save_training_data(training_data: List[List[Union[int, float]]], filename: s
     
     logging.info(f"Training data saved to {filename} ({len(training_data)} samples)")
 
-def append_training_data_batch(training_batch: List[List[Union[int, float]]], filename: str = constants.PATH + "/dirac_training_data.csv") -> None:
+def append_training_data_batch(training_batch: List[List[Union[int, float]]], filename: str = constants.PATH + "/Training_data/dirac_training_data.csv") -> None:
     """
     Append a batch of training data to CSV file. Creates file with headers if it doesn't exist.
     

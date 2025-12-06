@@ -16,6 +16,7 @@ from simulation_data_loader import simulation_data_analyzer
 from stats import statistics
 from TBG import Dirac_analysis
 from neural_network_base import neural_network, dummy_neuron
+from preprocess_training_data import preprocess_training_data, load_preprocessed_data
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -84,6 +85,10 @@ class dirac_network_trainer:
             self.current_learning_rate: float = self.training_config['learning_rate']
             self.loss_history: List[float] = []
             self.learning_rate_reductions: int = 0
+
+            # ν clamping statistics tracking
+            self.nu_clamp_count = 0
+            self.batch_sample_count = 0
             
             logger.info(f"dirac_network_trainer initialized with config: {self.training_config}")
             
@@ -222,21 +227,27 @@ class dirac_network_trainer:
     
     def pretrain_from_data(self, data_folder: Optional[str] = None, epochs: int = 200,
                           batch_size: Optional[int] = None, validation_split: Optional[float] = None,
-                          start_epoch: int = 0, resume_patience_counter: int = 0) -> dict:
+                          start_epoch: int = 0, resume_patience_counter: int = 0,
+                          resume_best_loss: Optional[float] = None) -> dict:
         """
-        Pretrain network on historical data using MSE loss.
-        
+        Pretrain network on historical data using minimum distance loss.
+
+        This method handles multi-valued Dirac point data by using a minimum distance
+        loss function that compares the network output to the closest valid Dirac point
+        for each parameter set, rather than averaging all targets.
+
         Args:
-            data_folder (str, optional): Path to training data
+            data_folder (str, optional): Path to training data. Defaults to 'Training_data'.
             epochs (int): Number of training epochs
             batch_size (int, optional): Batch size, uses config default if None
             validation_split (float, optional): Validation split, uses config default if None
             start_epoch (int): Starting epoch number for resume (for display/logging). Defaults to 0.
             resume_patience_counter (int): Resume early stopping patience counter. Defaults to 0.
-            
+            resume_best_loss (float, optional): Best validation loss from checkpoint to resume. If None, starts with infinity.
+
         Returns:
             dict: Training results and statistics
-            
+
         Raises:
             constants.physics_parameter_error: If no network set or training fails
         """
@@ -248,63 +259,90 @@ class dirac_network_trainer:
         validation_split = validation_split or self.training_config['validation_split']
         
         try:
-            logger.info("Starting pretraining phase...")
+            logger.info("Starting pretraining phase with minimum distance loss...")
             self.training_start_time = time.time()
             self.stats.start_time = self.training_start_time
-            
-            # Load data using project utility
-            analyzer = self.load_training_data(data_folder, remove_duplicates=False)
-            x_train, y_train = self.prepare_training_data(analyzer.data_points)
-            
-            # Split data
-            split_idx = int(len(x_train) * (1 - validation_split))
+
+            # Use default data folder if not specified
+            if data_folder is None:
+                data_folder = 'Training_data'
+
+            # Check if preprocessed data exists, if not run preprocessing
+            preprocessed_path = os.path.join(data_folder, 'grouped_training_data.pkl')
+            if not os.path.exists(preprocessed_path):
+                logger.info("Preprocessed data not found. Running preprocessing...")
+                input_csv = os.path.join(data_folder, 'dirac_training_data.csv')
+                preprocess_training_data(input_csv, preprocessed_path)
+                logger.info("Preprocessing complete!")
+
+            # Load grouped data
+            logger.info(f"Loading preprocessed data from {preprocessed_path}")
+            data = load_preprocessed_data(preprocessed_path)
+            training_samples = data['training_samples']
+            logger.info(f"Loaded {len(training_samples)} parameter sets with {data['total_dirac_points']} total Dirac points")
+
+            # Split data by parameter sets (not individual Dirac points)
+            split_idx = int(len(training_samples) * (1 - validation_split))
             np.random.seed(42)  # Fixed seed for consistent train/val split
-            indices = np.random.permutation(len(x_train))
+            indices = np.random.permutation(len(training_samples))
             np.random.seed()  # Reset seed for future randomness
             train_indices, val_indices = indices[:split_idx], indices[split_idx:]
+
+            train_samples = [training_samples[i] for i in train_indices]
+            val_samples = [training_samples[i] for i in val_indices]
+
+            logger.info(f"Training set: {len(train_samples)} parameter sets")
+            logger.info(f"Validation set: {len(val_samples)} parameter sets")
             
-            x_train_split, x_val = x_train[train_indices], x_train[val_indices]
-            y_train_split, y_val = y_train[train_indices], y_train[val_indices]
-            
-            logger.info(f"Training set: {len(x_train_split)} examples")
-            logger.info(f"Validation set: {len(x_val)} examples")
-            
-            # Debug network architecture - show ALL layers
+            # Log network architecture with parameter counts
             total_params = 0
             logger.info("=== NETWORK ARCHITECTURE ===")
             for i, layer in enumerate(self.current_network.layers):
                 if layer.Dummy:
-                    # Input layer - no parameters
+                    # Input layer - no trainable parameters
                     logger.info(f"Layer {i} (Input): {len(layer.neurons)} neurons, 0 parameters")
                 else:
-                    # Hidden/output layer - count parameters
-                    layer_params = sum(len(neuron.inputs) for neuron in layer.neurons)
+                    # Hidden/output layer - count weights and biases
+                    # Each neuron has: len(inputs) weights + 1 bias
+                    layer_params = sum(len(neuron.inputs) + 1 for neuron in layer.neurons)
                     total_params += layer_params
                     layer_type = "Hidden" if i < len(self.current_network.layers) - 1 else "Output"
                     logger.info(f"Layer {i} ({layer_type}): {len(layer.neurons)} neurons, {layer_params} parameters")
             logger.info(f"Total network parameters: {total_params}")
             logger.info("==========================")
             
-            # Store original loss function
+            # Store original loss function and set minimum distance loss
+            # Wrap loss function so backward() doesn't need to pass weights
+            def wrapped_min_dist_loss(output, weights=None):
+                # Ignore weights parameter from backward(), use proper supervised weights
+                loss, gradients, _, _ = self._minimum_distance_loss_function(output, constants.DEFAULT_SUPERVISED_LOSS_WEIGHTS)
+                return loss, gradients
+
             original_loss_func = self.current_network.loss_function_and_grad
-            self.current_network.loss_function_and_grad = self._mse_loss_function
-            
+            self.current_network.loss_function_and_grad = wrapped_min_dist_loss
+
             # Training loop with statistics tracking
-            best_val_loss = float('inf')
+            best_val_loss = resume_best_loss if resume_best_loss is not None else float('inf')
             patience_counter = resume_patience_counter
             training_losses = []
             validation_losses = []
-            
+
+            if resume_best_loss is not None:
+                logger.info(f"Resuming training with best validation loss: {best_val_loss:.6f}")
+            else:
+                logger.info("Starting training from scratch (no previous best loss)")
+
             for epoch in range(epochs):
                 epoch_start_time = time.time()
-                
-                # Shuffle and train
-                epoch_indices = np.random.permutation(len(x_train_split))
-                x_epoch = x_train_split[epoch_indices]
-                y_epoch = y_train_split[epoch_indices]
-                
-                epoch_loss = self._train_epoch(x_epoch, y_epoch, batch_size)
-                val_loss = self._evaluate_validation_loss(x_val, y_val)
+
+                # Shuffle and train with grouped data (with fixed seed for reproducibility)
+                np.random.seed(constants.EPOCH_SHUFFLE_SEED + epoch)
+                epoch_indices = np.random.permutation(len(train_samples))
+                np.random.seed()  # Reset seed for other operations
+                shuffled_train_samples = [train_samples[i] for i in epoch_indices]
+
+                epoch_loss = self._train_epoch_grouped(shuffled_train_samples, batch_size)
+                val_loss = self._evaluate_validation_loss_grouped(val_samples)
                 
                 training_losses.append(epoch_loss)
                 validation_losses.append(val_loss)
@@ -324,7 +362,7 @@ class dirac_network_trainer:
                 epoch_duration = time.time() - epoch_start_time
                 self.stats.log_combination(
                     duration=epoch_duration,
-                    system_size=len(x_train_split),
+                    system_size=len(train_samples),
                     n_scale=self.current_learning_rate,  # Use current adaptive learning rate
                     success=(val_loss < best_val_loss),
                     no_intersection=True,
@@ -369,8 +407,8 @@ class dirac_network_trainer:
                             'epochs_without_improvement': patience_counter,
                             'checkpoint_type': 'training',
                             'timestamp': current_time,
-                            'training_examples': len(x_train_split),
-                            'validation_examples': len(x_val)
+                            'training_examples': len(train_samples),
+                            'validation_examples': len(val_samples)
                         }
                         success = self.persistence.save_network_weights(checkpoint_filename, checkpoint_metadata)
                         if success:
@@ -399,8 +437,8 @@ class dirac_network_trainer:
                             'epochs_without_improvement': 0,
                             'checkpoint_type': 'best_model',
                             'timestamp': current_time,
-                            'training_examples': len(x_train_split),
-                            'validation_examples': len(x_val)
+                            'training_examples': len(train_samples),
+                            'validation_examples': len(val_samples)
                         }
                         self.persistence.save_network_weights("best_model.npz", best_model_metadata)
                         logger.info(f"New best model saved at epoch {start_epoch + epoch + 1} with val loss: {best_val_loss:.6f}")
@@ -417,15 +455,35 @@ class dirac_network_trainer:
             logger.info(f"Pretraining completed! Final validation loss: {best_val_loss:.6f}")
             logger.info(f"Training time: {training_time/60:.1f} minutes")
             
+            # After training completes, copy best model to final_trained_model.npz
+            if hasattr(self, 'persistence') and self.persistence is not None:
+                import shutil
+                best_model_path = os.path.join(constants.PATH, "best_model.npz")
+                final_model_path = os.path.join(constants.PATH, "final_trained_model.npz")
+
+                if os.path.exists(best_model_path):
+                    # Backup existing final model if it exists
+                    if os.path.exists(final_model_path):
+                        backup_path = os.path.join(constants.PATH, "final_trained_model.backup.npz")
+                        shutil.copy2(final_model_path, backup_path)
+                        logger.info(f"Backed up existing final model to {backup_path}")
+
+                    # Copy best model to final
+                    shutil.copy2(best_model_path, final_model_path)
+                    logger.info(f"Copied best model (epoch with val loss {best_val_loss:.6f}) to final_trained_model.npz")
+                else:
+                    logger.warning("Best model file not found - final_trained_model.npz not updated")
+
             return {
                 'training_losses': training_losses,
                 'validation_losses': validation_losses,
                 'best_val_loss': best_val_loss,
+                'best_model_epoch': best_model_metadata.get('epoch', 0) if 'best_model_metadata' in locals() else 0,
                 'epochs_completed': epoch + 1,
                 'training_time': training_time,
-                'training_examples': len(x_train_split)
+                'training_examples': len(train_samples)
             }
-            
+
         except Exception as e:
             logger.error(f"Pretraining failed: {str(e)}")
             raise constants.physics_parameter_error(f"Pretraining failed: {str(e)}")
@@ -460,7 +518,12 @@ class dirac_network_trainer:
             validated_params = self.current_network_builder.set_network_parameters(params)
             
             # Set physics-based loss function
-            self.current_network.loss_function_and_grad = self._physics_loss_function
+            # Wrap loss function so backward() doesn't need to pass weights
+            def wrapped_physics_loss(output, weights=None):
+                # Ignore weights parameter from backward(), use proper physics weights
+                return self._physics_loss_function(output, loss_weights)
+
+            self.current_network.loss_function_and_grad = wrapped_physics_loss
             
             # Get initial loss
             initial_output = self.current_network.compute()
@@ -498,89 +561,209 @@ class dirac_network_trainer:
             logger.error(f"Physics-based training failed: {str(e)}")
             raise constants.physics_parameter_error(f"Physics training failed: {str(e)}")
     
-    def _train_epoch(self, x_data: np.ndarray, y_data: np.ndarray, batch_size: int) -> float:
+    def _train_epoch_grouped(self, training_samples: List[Dict[str, Any]], batch_size: int) -> float:
         """
-        Train for one epoch - simplified approach to fix fundamental weight update bug.
-        
+        Train for one epoch using grouped data with minimum distance loss.
+
         Args:
-            x_data (np.ndarray): Input data
-            y_data (np.ndarray): Target data
+            training_samples (List[Dict[str, Any]]): List of parameter sets with their Dirac points
             batch_size (int): Size of mini-batches
-            
+
         Returns:
             float: Average epoch loss
         """
         epoch_loss = 0.0
         num_samples = 0
-        
-        # CRITICAL FIX: Ensure loss function is set on network
-        self.current_network.loss_function_and_grad = self._mse_loss_function
-        
-        for i in range(0, len(x_data), batch_size):
-            batch_x = x_data[i:i+batch_size]
-            batch_y = y_data[i:i+batch_size]
+
+        # CRITICAL: Ensure minimum distance loss function is set
+        # Wrap loss function so backward() doesn't need to pass weights
+        def wrapped_min_dist_loss(output, weights=None):
+            # Ignore weights parameter from backward(), use proper supervised weights
+            loss, gradients, _, _ = self._minimum_distance_loss_function(output, constants.DEFAULT_SUPERVISED_LOSS_WEIGHTS)
+            return loss, gradients
+
+        self.current_network.loss_function_and_grad = wrapped_min_dist_loss
+
+        # Reset ν clamping counters at start of each epoch
+        self.nu_clamp_count = 0
+        self.batch_sample_count = 0
+
+        # Log initial network state before any training
+        for neuron in self.current_network.layers[0].neurons:
+            neuron.output = 0.0
+        init_output = self.current_network.compute()
+        output_layer = self.current_network.layers[-1]
+        k_x1_init_bias = output_layer.neurons[0].bias if hasattr(output_layer.neurons[0], 'bias') else 0.0
+        k_y1_init_bias = output_layer.neurons[1].bias if hasattr(output_layer.neurons[1], 'bias') else 0.0
+        k_x2_init_bias = output_layer.neurons[3].bias if hasattr(output_layer.neurons[3], 'bias') else 0.0
+        k_y2_init_bias = output_layer.neurons[4].bias if hasattr(output_layer.neurons[4], 'bias') else 0.0
+        logger.info(f"INITIAL STATE (before training): Pred1 = [{init_output[0]:.4f}, {init_output[1]:.4f}, {init_output[2]:.4f}], "
+                   f"Pred2 = [{init_output[3]:.4f}, {init_output[4]:.4f}, {init_output[5]:.4f}], "
+                   f"Biases = [k_x1:{k_x1_init_bias:.4f}, k_y1:{k_y1_init_bias:.4f}, k_x2:{k_x2_init_bias:.4f}, k_y2:{k_y2_init_bias:.4f}]")
+
+        # Track gradient statistics for monitoring explosion/vanishing
+        gradient_k_x = []
+        gradient_k_y = []
+        gradient_nu = []
+        gradient_total = []
+
+        for i in range(0, len(training_samples), batch_size):
+            batch_samples = training_samples[i:i+batch_size]
             batch_num = i // batch_size + 1
-            total_batches = (len(x_data) - 1) // batch_size + 1
-            
+            total_batches = (len(training_samples) - 1) // batch_size + 1
+
             batch_loss = 0.0
-            
-            # Process each sample and update weights
-            for j in range(len(batch_x)):
-                self._set_network_inputs(batch_x[j])
-                self._set_target_output(batch_y[j])
-                
-                # Forward pass and compute loss
+
+            # Standard training: forward pass, compute gradients, update weights
+            for sample in batch_samples:
+                # Use TRANSFORMED parameters (1/a, 1/b, ...) for network input
+                # This is critical for numerical stability and learning
+                params_transformed = sample['parameters_transformed']
+                dirac_points = sample['dirac_points']
+
+                self._set_network_inputs(params_transformed)
+                self._set_target_outputs(dirac_points)
+
+                # Forward pass
                 output = self.current_network.compute()
-                loss, gradients = self._mse_loss_function(output, [1.0, 1.0, 1.0])
-                
-                self.current_network.update_weights()
+
+                # Compute loss and gradients (with repulsion built-in)
+                loss, gradients, closest_target1, closest_target2 = self._minimum_distance_loss_function(
+                    output, constants.DEFAULT_SUPERVISED_LOSS_WEIGHTS
+                )
+
+                # Track gradient magnitudes for all 6 outputs
+                gradient_k_x.append(abs(gradients[0]))  # k_x1
+                gradient_k_y.append(abs(gradients[1]))  # k_y1
+                gradient_nu.append(abs(gradients[2]))   # nu1
+                # Also track second prediction gradients
+                gradient_k_x.append(abs(gradients[3]))  # k_x2
+                gradient_k_y.append(abs(gradients[4]))  # k_y2
+                gradient_nu.append(abs(gradients[5]))   # nu2
+                gradient_total.append(np.linalg.norm(gradients))
+
+                # Apply gradients via custom backprop
+                self.current_network.backward_with_custom_gradients(gradients)
+
+                # Update weights with computed gradients
+                for layer_obj in self.current_network.layers:
+                    layer_obj.update_weights()
+
                 batch_loss += loss
                 num_samples += 1
-            
-            # Print batch progress every N batches or at end
-            if batch_num % constants.BATCH_LOGGING_FREQUENCY == 0 or batch_num == total_batches:
-                avg_batch_loss = batch_loss / len(batch_x)
-                
+
+            # Print batch progress: every batch for first 20, then every 10 batches
+            should_log = (batch_num <= 20) or (batch_num % 10 == 0) or (batch_num == total_batches)
+            if should_log:
+                avg_batch_loss = batch_loss / len(batch_samples)
+
                 # Sample current network output without changing inputs
                 network_outputs = "N/A"
+                hidden_info = ""
+                repulsion_info = ""
                 try:
                     # Just compute with whatever inputs are currently set
                     raw_output = self.current_network.compute()
-                    if len(raw_output) >= 3:
-                        network_outputs = f"[{raw_output[0]:.4f}, {raw_output[1]:.4f}, {raw_output[2]:.4f}]"
+                    if len(raw_output) >= 6:
+                        # Show both predictions
+                        network_outputs = f"Pred1=[{raw_output[0]:.4f}, {raw_output[1]:.4f}, {raw_output[2]:.4f}], Pred2=[{raw_output[3]:.4f}, {raw_output[4]:.4f}, {raw_output[5]:.4f}]"
+
+                        # Calculate k-space separation for monitoring repulsion
+                        k_sep = np.sqrt((raw_output[0] - raw_output[3])**2 + (raw_output[1] - raw_output[4])**2)
+                        repulsion_info = f", k-sep={k_sep:.4f}"
+
+                        # Get hidden layer statistics for monitoring saturation
+                        output_layer = self.current_network.layers[-1]
+                        hidden_layer = self.current_network.layers[-2]  # Last hidden layer
+                        hidden_outputs = np.array([n.output for n in hidden_layer.neurons])
+                        hidden_mag = np.mean(np.abs(hidden_outputs))
+                        hidden_max = np.max(np.abs(hidden_outputs))
+                        hidden_info = f", Hidden: {hidden_mag:.2f}+/-{hidden_max:.2f}"
+
+                        # Always show bias values for first 20 batches to diagnose collapse
+                        if (batch_num <= 20 or logger.isEnabledFor(logging.DEBUG)) and len(output_layer.neurons) >= 2:
+                            k_x_neuron = output_layer.neurons[0]
+                            k_y_neuron = output_layer.neurons[1]
+                            k_x_pre = k_x_neuron.sum
+                            k_y_pre = k_y_neuron.sum
+                            k_x_weights = np.array([w for _, w in k_x_neuron.inputs])
+                            k_y_weights = np.array([w for _, w in k_y_neuron.inputs])
+                            k_x_weights_mag = np.mean(np.abs(k_x_weights))
+                            k_y_weights_mag = np.mean(np.abs(k_y_weights))
+                            k_x_bias = k_x_neuron.bias if hasattr(k_x_neuron, 'bias') else 0.0
+                            k_y_bias = k_y_neuron.bias if hasattr(k_y_neuron, 'bias') else 0.0
+
+                            # Use info level for first 20 batches, debug otherwise
+                            log_func = logger.info if batch_num <= 20 else logger.debug
+                            log_func(f"   Pre-activation: [{k_x_pre:.4f}, {k_y_pre:.4f}], "
+                                   f"Weights: [{k_x_weights_mag:.4f}, {k_y_weights_mag:.4f}], "
+                                   f"Biases: [{k_x_bias:.4f}, {k_y_bias:.4f}]")
                     else:
                         network_outputs = f"{raw_output}"
                 except Exception as e:
                     network_outputs = f"Error: {str(e)[:20]}"
-                
-                logger.info(f"   Batch {batch_num}/{total_batches}: Avg Loss = {avg_batch_loss:.4f}, Output = {network_outputs}")
-            
+
+                # Calculate clamping statistics
+                clamp_percentage = (self.nu_clamp_count / self.batch_sample_count * 100) if self.batch_sample_count > 0 else 0
+
+                # Calculate gradient statistics (mean and max for recent samples in this batch)
+                recent_grad_k_x = gradient_k_x[-len(batch_samples):] if gradient_k_x else [0]
+                recent_grad_k_y = gradient_k_y[-len(batch_samples):] if gradient_k_y else [0]
+                recent_grad_nu = gradient_nu[-len(batch_samples):] if gradient_nu else [0]
+                recent_grad_total = gradient_total[-len(batch_samples):] if gradient_total else [0]
+
+                grad_stats = (f"Grads: k_x={np.mean(recent_grad_k_x):.2e}+/-{np.max(recent_grad_k_x):.2e}, "
+                             f"k_y={np.mean(recent_grad_k_y):.2e}+/-{np.max(recent_grad_k_y):.2e}, "
+                             f"nu={np.mean(recent_grad_nu):.2e}+/-{np.max(recent_grad_nu):.2e}, "
+                             f"total={np.mean(recent_grad_total):.2e}+/-{np.max(recent_grad_total):.2e}")
+
+                logger.info(f"   Batch {batch_num}/{total_batches}: Avg Loss = {avg_batch_loss:.4f}, {network_outputs}{repulsion_info}{hidden_info}, nu Clamped: {self.nu_clamp_count}/{self.batch_sample_count} ({clamp_percentage:.1f}%)")
+                logger.info(f"   {grad_stats}")
+
+                # Reset counters after logging every 100 batches
+                if batch_num % 100 == 0:
+                    self.nu_clamp_count = 0
+                    self.batch_sample_count = 0
+
             epoch_loss += batch_loss
-        
+
         return epoch_loss / num_samples
-    
-    def _evaluate_validation_loss(self, x_val: np.ndarray, y_val: np.ndarray) -> float:
-        """Evaluate loss on validation set."""
+
+    def _evaluate_validation_loss_grouped(self, validation_samples: List[Dict[str, Any]]) -> float:
+        """
+        Evaluate loss on validation set using grouped data.
+
+        Args:
+            validation_samples (List[Dict[str, Any]]): List of parameter sets with their Dirac points
+
+        Returns:
+            float: Average validation loss
+        """
         # Clear any previous state to avoid contamination
-        self._current_target = None
+        self._current_targets = None
         total_loss = 0.0
-        
+
         # Shuffle validation set each time to ensure different evaluation order
-        val_indices = np.random.permutation(len(x_val))
-        
+        val_indices = np.random.permutation(len(validation_samples))
+
         for i in val_indices:
-            self._set_network_inputs(x_val[i])
-            self._set_target_output(y_val[i])
-            
+            sample = validation_samples[i]
+            # Use TRANSFORMED parameters (1/a, 1/b, ...) for network input
+            params_transformed = sample['parameters_transformed']
+            dirac_points = sample['dirac_points']
+
+            self._set_network_inputs(params_transformed)
+            self._set_target_outputs(dirac_points)
+
             # Compute fresh network output (no caching)
             output = self.current_network.compute()
-            loss, _ = self._mse_loss_function(output, [1.0, 1.0, 1.0])
+            loss, _, _, _ = self._minimum_distance_loss_function(output, constants.DEFAULT_SUPERVISED_LOSS_WEIGHTS)
             total_loss += loss
-        
-        # Clear target after validation to prevent interference
-        self._current_target = None
-        return total_loss / len(x_val)
-    
+
+        # Clear targets after validation to prevent interference
+        self._current_targets = None
+        return total_loss / len(validation_samples)
+
     def _set_network_inputs(self, input_values: np.ndarray) -> None:
         """Set input layer values for training."""
         if len(input_values) != len(self.current_network.layers[0].neurons):
@@ -595,30 +778,163 @@ class dirac_network_trainer:
     def _set_target_output(self, target: np.ndarray) -> None:
         """Store target output for loss computation."""
         self._current_target = target
+
+    def _set_target_outputs(self, targets: List[np.ndarray]) -> None:
+        """
+        Store multiple target outputs for minimum distance loss computation.
+
+        Args:
+            targets: List of target arrays, each [k_x, k_y, velocity]
+        """
+        self._current_targets = targets
     
     def _mse_loss_function(self, output: List[float], weights: List[float]) -> Tuple[float, np.ndarray]:
         """
         Mean Squared Error loss function for data-based pretraining.
-        
+
         Args:
             output: Network output [k_x, k_y, velocity]
             weights: Dummy weights (not used for MSE)
-            
+
         Returns:
             Tuple[float, np.ndarray]: (loss, gradients)
         """
         if not hasattr(self, '_current_target') or self._current_target is None:
             return 0.0, np.zeros(3)
-        
-        output_array = np.array(output)
+
+        # Clamp ν (third output) to valid range to prevent physics violations
+        output_clamped = output.copy()
+        output_clamped[2] = max(constants.NU_CLAMP_MIN, min(constants.NU_CLAMP_MAX, output[2]))
+
+        # Track clamping statistics
+        if abs(output[2] - output_clamped[2]) > 1e-6:
+            self.nu_clamp_count += 1
+        self.batch_sample_count += 1
+
+        output_array = np.array(output_clamped)
         target_array = np.array(self._current_target)
-        
+
         # Standard MSE loss and gradients (no artificial scaling)
         diff = output_array - target_array
         loss = 0.5 * np.sum(diff ** 2)
         gradients = diff  # Pure MSE gradients without scaling tricks
-        
+
         return loss, gradients
+
+    def _minimum_distance_loss_function(self, output: List[float], weights: List[float]) -> Tuple[float, np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Two-point minimum distance loss with Coulomb repulsion.
+
+        Predicts TWO Dirac points with repulsion between them to prevent collapse.
+        Each prediction finds its closest valid target. Repulsion forces diversity.
+
+        Args:
+            output: Network output [k_x1, k_y1, nu1, k_x2, k_y2, nu2]
+            weights: Loss weights [k_x_weight, k_y_weight, nu_weight] applied to EACH prediction
+                     Default: [0.6, 0.6, 0.4] to emphasize k-points
+
+        Returns:
+            Tuple[float, np.ndarray, np.ndarray, np.ndarray]:
+                (total_loss, gradient_vector, closest_target1, closest_target2)
+                total_loss: loss1 + loss2 + repulsion
+                gradient_vector: gradients for all 6 outputs
+                closest_target1: closest target for first prediction
+                closest_target2: closest target for second prediction
+        """
+        if not hasattr(self, '_current_targets') or self._current_targets is None:
+            return 0.0, np.zeros(6), np.zeros(3), np.zeros(3)
+
+        # Extract two predictions from output
+        pred1 = np.array([output[0], output[1], output[2]])  # [k_x1, k_y1, nu1]
+        pred2 = np.array([output[3], output[4], output[5]])  # [k_x2, k_y2, nu2]
+
+        # Clamp nu values to valid range
+        pred1[2] = max(constants.NU_CLAMP_MIN, min(constants.NU_CLAMP_MAX, pred1[2]))
+        pred2[2] = max(constants.NU_CLAMP_MIN, min(constants.NU_CLAMP_MAX, pred2[2]))
+
+        # Track clamping statistics
+        if abs(output[2] - pred1[2]) > 1e-6:
+            self.nu_clamp_count += 1
+        if abs(output[5] - pred2[2]) > 1e-6:
+            self.nu_clamp_count += 1
+        self.batch_sample_count += 1
+
+        # Use default weights if not provided
+        if weights is None or len(weights) != 3:
+            loss_weights = np.array(constants.DEFAULT_SUPERVISED_LOSS_WEIGHTS)
+        else:
+            loss_weights = np.array(weights)
+
+        # Find closest target for prediction 1
+        min_loss1 = float('inf')
+        closest_idx1 = 0
+        for idx, target in enumerate(self._current_targets):
+            # Convert target from [k_x, k_y, velocity] to [k_x, k_y, nu]
+            # NN outputs nu, but targets contain velocity, so we must convert
+            target_k_x, target_k_y, target_velocity = target[0], target[1], target[2]
+            target_nu = 1.0 / (1.0 + abs(target_velocity))  # Convert velocity -> nu
+            target_array = np.array([target_k_x, target_k_y, target_nu])
+
+            diff = pred1 - target_array
+            weighted_loss = 0.5 * np.sum(loss_weights * diff ** 2)
+            if weighted_loss < min_loss1:
+                min_loss1 = weighted_loss
+                closest_idx1 = idx
+
+        # Find closest target for prediction 2
+        min_loss2 = float('inf')
+        closest_idx2 = 0
+        for idx, target in enumerate(self._current_targets):
+            # Convert target from [k_x, k_y, velocity] to [k_x, k_y, nu]
+            target_k_x, target_k_y, target_velocity = target[0], target[1], target[2]
+            target_nu = 1.0 / (1.0 + abs(target_velocity))  # Convert velocity -> nu
+            target_array = np.array([target_k_x, target_k_y, target_nu])
+
+            diff = pred2 - target_array
+            weighted_loss = 0.5 * np.sum(loss_weights * diff ** 2)
+            if weighted_loss < min_loss2:
+                min_loss2 = weighted_loss
+                closest_idx2 = idx
+
+        # Compute Coulomb repulsion in k-space only (not nu)
+        k_diff = np.array([pred1[0] - pred2[0], pred1[1] - pred2[1]])
+        k_distance = np.sqrt(k_diff[0]**2 + k_diff[1]**2)
+        repulsion_energy = constants.REPULSION_WEIGHT / (k_distance + constants.REPULSION_EPSILON)
+
+        # Total loss
+        total_loss = min_loss1 + min_loss2 + repulsion_energy
+
+        # Gradients for prediction 1
+        # Convert closest target from [k_x, k_y, velocity] to [k_x, k_y, nu]
+        closest_target1_raw = self._current_targets[closest_idx1]
+        target1_nu = 1.0 / (1.0 + abs(closest_target1_raw[2]))
+        closest_target1 = np.array([closest_target1_raw[0], closest_target1_raw[1], target1_nu])
+        diff1 = pred1 - closest_target1
+        grad1 = loss_weights * diff1
+
+        # Gradients for prediction 2
+        # Convert closest target from [k_x, k_y, velocity] to [k_x, k_y, nu]
+        closest_target2_raw = self._current_targets[closest_idx2]
+        target2_nu = 1.0 / (1.0 + abs(closest_target2_raw[2]))
+        closest_target2 = np.array([closest_target2_raw[0], closest_target2_raw[1], target2_nu])
+        diff2 = pred2 - closest_target2
+        grad2 = loss_weights * diff2
+
+        # Repulsion gradients (only for k-space, not nu)
+        # d/d(pred1) [W / (|pred1 - pred2| + eps)] = -W * (pred1 - pred2) / (|pred1 - pred2| + eps)^2 / |pred1 - pred2|
+        repulsion_grad_magnitude = -constants.REPULSION_WEIGHT / ((k_distance + constants.REPULSION_EPSILON)**2 * (k_distance + 1e-10))
+        repulsion_grad_k = repulsion_grad_magnitude * k_diff
+
+        # Add repulsion gradients to k-components only
+        grad1[0] += repulsion_grad_k[0]  # k_x1
+        grad1[1] += repulsion_grad_k[1]  # k_y1
+        grad2[0] += -repulsion_grad_k[0]  # k_x2 (opposite direction)
+        grad2[1] += -repulsion_grad_k[1]  # k_y2 (opposite direction)
+
+        # Combine gradients into single vector
+        gradients = np.concatenate([grad1, grad2])
+
+        return total_loss, gradients, closest_target1, closest_target2
     
     def _physics_loss_function(self, output: List[float], weights: List[float]) -> Tuple[float, np.ndarray]:
         """
@@ -636,9 +952,18 @@ class dirac_network_trainer:
         
         if len(weights) != 3 or len(output) != 3:
             raise ValueError("Must provide 3 weights and 3 outputs")
-        
-        k_point = output[:2]
-        velocity_pred = output[2]
+
+        # Clamp ν (third output) to valid range to prevent physics violations
+        output_clamped = list(output)
+        output_clamped[2] = max(constants.NU_CLAMP_MIN, min(constants.NU_CLAMP_MAX, output[2]))
+
+        # Track clamping statistics
+        if abs(output[2] - output_clamped[2]) > 1e-6:
+            self.nu_clamp_count += 1
+        self.batch_sample_count += 1
+
+        k_point = output_clamped[:2]
+        velocity_pred = output_clamped[2]
         
         # Compute Dirac point metrics and their gradients
         dirac_analyzer = Dirac_analysis(self.current_network_builder.current_periodic_graph)
@@ -656,16 +981,6 @@ class dirac_network_trainer:
         
         return loss_function, np.array([loss_function_der_n_1, loss_function_der_n_2, loss_function_der_vel])
     
-    def _initialize_gradient_accumulator(self) -> dict:
-        """Initialize gradient accumulator for mini-batch processing."""
-        accumulator = {}
-        for layer_idx, layer in enumerate(self.current_network.layers):
-            if not layer.Dummy:  # Skip input layers
-                accumulator[layer_idx] = []
-                for neuron_idx, neuron in enumerate(layer.neurons):
-                    accumulator[layer_idx].append(np.zeros(len(neuron.inputs)))
-        return accumulator
-
     def _detect_loss_explosion(self, current_loss: float) -> bool:
         """
         Detect if loss has exploded based on recent history.
@@ -730,13 +1045,13 @@ class dirac_network_trainer:
         for layer in self.current_network.layers:
             if not layer.Dummy:  # Skip input layers
                 for neuron in layer.neurons:
-                    for input_connection in neuron.inputs:
-                        # input_connection is a tuple (source_neuron, weight)
-                        # The weight is stored in an ADAM optimizer
-                        if hasattr(neuron, 'Adam_corrector'):
-                            # Find the corresponding ADAM optimizer
-                            for i, adam_opt in enumerate(neuron.Adam_corrector):
-                                adam_opt.alpha = new_lr
+                    # Update learning rate in all ADAM optimizers for this neuron
+                    if hasattr(neuron, 'Adam_corrector'):
+                        for adam_opt in neuron.Adam_corrector:
+                            adam_opt.alpha = new_lr
+                    # Update bias ADAM optimizer if present
+                    if hasattr(neuron, 'bias_adam') and neuron.bias_adam is not None:
+                        neuron.bias_adam.alpha = new_lr
     
 
     def get_training_statistics(self) -> dict:
@@ -764,5 +1079,9 @@ class dirac_network_trainer:
         self.current_learning_rate = self.training_config['learning_rate']
         self.loss_history = []
         self.learning_rate_reductions = 0
+
+        # Reset ν clamping statistics
+        self.nu_clamp_count = 0
+        self.batch_sample_count = 0
 
         logger.info("dirac_network_trainer state reset")

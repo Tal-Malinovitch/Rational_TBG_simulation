@@ -21,6 +21,8 @@ from stats import statistics
 from TBG import tbg, Dirac_analysis
 from utils import compute_twist_constants
 from simulation_data_loader import simulation_data_analyzer
+from run_comprehensive_benchmark import run_comprehensive_benchmark
+from comprehensive_benchmark_design import benchmark_test_suite
 
 # Configure global logging
 logger = logging.getLogger(__name__)
@@ -31,7 +33,7 @@ default_orchestrator_config = {
     'training_config': None,  # Use trainer defaults
     'benchmark_config': None,  # Use benchmark defaults
     'persistence_config': None,  # Use persistence defaults
-    'auto_save': True,
+    'auto_save': False,  # Disabled - explicit save as 'final_trained_model.npz' in main() instead
     'default_model_name': 'dirac_nn_model.npz'
 }
 
@@ -117,13 +119,17 @@ class nn_dirac_point:
         output = self.network.compute()
         
         # Convert ν = 1/(1+v) back to velocity: v = (1-ν)/ν
-        k_x, k_y, nu = output[0], output[1], output[2]
-        
-        # Handle edge cases for ν transformation
-        if nu <= 0.0001:  # Avoid division by zero, corresponds to very large velocity
-            velocity = 10000.0  # Cap at large value
-        else:
-            velocity = (1.0 - nu) / nu
+        k_x, k_y, nu_raw = output[0], output[1], output[2]
+
+        # Clamp ν to valid range to prevent physics violations
+        nu = max(constants.NU_CLAMP_MIN, min(constants.NU_CLAMP_MAX, nu_raw))
+
+        # Log if clamping occurred for monitoring training stability
+        if abs(nu_raw - nu) > 1e-6:
+            logger.warning(f"nu clamped from {nu_raw:.6f} to {nu:.6f} for stability")
+
+        # Convert to velocity with clamped ν
+        velocity = (1.0 - nu) / nu
             
         return k_x, k_y, velocity
     
@@ -260,7 +266,7 @@ class nn_dirac_point:
                      batch_size: int = 64, validation_split: float = 0.15,
                      save_checkpoints: bool = True, checkpoint_interval: int = 50,
                      early_stopping_patience: int = 100, start_epoch: int = 0,
-                     resume_patience_counter: int = 0) -> Dict[str, Any]:
+                     resume_patience_counter: int = 0, resume_best_loss: Optional[float] = None) -> Dict[str, Any]:
         """
         General-purpose training method focused on comprehensive statistics and performance analysis.
         
@@ -279,6 +285,7 @@ class nn_dirac_point:
             early_stopping_patience (int): Epochs to wait before early stopping. Defaults to 100.
             start_epoch (int): Epoch number to start/resume from. Defaults to 0.
             resume_patience_counter (int): Resume early stopping patience counter. Defaults to 0.
+            resume_best_loss (float, optional): Best validation loss from checkpoint to resume. Defaults to None.
 
         Returns:
             Dict[str, Any]: Comprehensive training results and statistics
@@ -290,7 +297,8 @@ class nn_dirac_point:
             batch_size=batch_size,
             validation_split=validation_split,
             start_epoch=start_epoch,
-            resume_patience_counter=resume_patience_counter
+            resume_patience_counter=resume_patience_counter,
+            resume_best_loss=resume_best_loss
         )
         
         # Auto-save if configured
@@ -396,10 +404,10 @@ class nn_dirac_point:
     def cleanup_old_checkpoints(self, keep_last_n: int = 5) -> int:
         """
         Remove old checkpoint files, keeping only the most recent ones.
-        
+
         Args:
             keep_last_n (int): Number of recent checkpoints to keep
-            
+
         Returns:
             int: Number of checkpoints removed
         """
@@ -410,16 +418,92 @@ class nn_dirac_point:
 if __name__ == "__main__":
     """
     Example usage of the refactored neural network with comprehensive training statistics.
-    
+
     This example demonstrates:
-    1. General-purpose training with comprehensive statistics and benchmarking
-    2. Automatic model checkpointing and early stopping
-    3. Performance analysis and acceleration factor measurement
-    4. Detailed training monitoring and result saving
+    1. Optional training data generation with parallel processing
+    2. General-purpose training with comprehensive statistics and benchmarking
+    3. Automatic model checkpointing and early stopping
+    4. Performance analysis and acceleration factor measurement
+    5. Detailed training monitoring and result saving
     """
-    
+
+    # Add file handler to save all logs to training_output.log
+    log_file = os.path.join(constants.PATH, "training_output.log")
+    file_handler = logging.FileHandler(log_file, mode='w')
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+    logging.getLogger().addHandler(file_handler)
+
     logger.info("NEURAL NETWORK FOR DIRAC POINT PREDICTION")
     logger.info("=" * 50)
+    logger.info(f"Logging to file: {log_file}")
+
+    # Check if user wants to generate training data first
+    import sys
+    if '--generate-data' in sys.argv or '-g' in sys.argv:
+        logger.info("\n" + "=" * 50)
+        logger.info("TRAINING DATA GENERATION MODE")
+        logger.info("=" * 50)
+
+        from Generate_training_data import create_training_data
+
+        # Check for existing checkpoint
+        checkpoint_file = os.path.join(constants.PATH, "training_checkpoint.json")
+        if os.path.exists(checkpoint_file):
+            logger.info("Found existing checkpoint - data generation will RESUME")
+        else:
+            logger.info("No checkpoint found - starting fresh data generation")
+
+        # Display configuration
+        import multiprocessing as mp
+        total_cores = mp.cpu_count()
+        num_processes = max(1, total_cores - constants.RESERVED_CORES)
+        logger.info(f"\nParallel processing configuration:")
+        logger.info(f"  Total cores: {total_cores}")
+        logger.info(f"  Reserved for user: {constants.RESERVED_CORES}")
+        logger.info(f"  Using for generation: {num_processes}")
+        logger.info(f"\nQuality thresholds:")
+        logger.info(f"  ADAM convergence: {constants.DEFAULT_TOLERANCE}")
+        logger.info(f"  Max gap: {constants.MAX_GAP_THRESHOLD}")
+        logger.info(f"  Max R²: {constants.MAX_R2_THRESHOLD}")
+        logger.info(f"  Max isotropy: {constants.MAX_ISOTROPY_THRESHOLD}")
+        logger.info("\nStarting data generation...\n")
+
+        try:
+            total_samples = create_training_data(
+                batch_size=constants.DEFAULT_BATCH_SIZE,
+                resume_from_checkpoint=True,
+                use_parallel=True,
+                num_processes=None  # Auto-detect with reserved cores
+            )
+
+            logger.info("\n" + "=" * 50)
+            logger.info(f"DATA GENERATION COMPLETE: {total_samples} samples generated")
+            logger.info("=" * 50)
+
+            # Preprocess the newly generated data to create grouped pkl file
+            logger.info("\nPreprocessing training data...")
+            from preprocess_training_data import preprocess_training_data
+            try:
+                preprocess_training_data()
+                logger.info("Training data preprocessed successfully!")
+            except Exception as e:
+                logger.error(f"Failed to preprocess training data: {e}")
+                logger.error("Cannot proceed to training without preprocessed data")
+                sys.exit(1)
+
+            logger.info("\nProceeding to network training...\n")
+
+        except KeyboardInterrupt:
+            logger.info("\n" + "=" * 50)
+            logger.info("DATA GENERATION INTERRUPTED BY USER")
+            logger.info("=" * 50)
+            logger.info("Checkpoint saved - resume with same command")
+            sys.exit(0)
+        except Exception as e:
+            logger.error(f"\nData generation failed: {e}")
+            logger.error("Cannot proceed to training without data")
+            sys.exit(1)
     
     # Create the network (no parameters needed during initialization)
     nn = nn_dirac_point()
@@ -440,15 +524,19 @@ if __name__ == "__main__":
     # If no final model, try to resume from latest checkpoint
     resume_epoch = 0
     resume_patience_counter = 0
+    resume_best_loss = None
     if not trained:
         logger.info("Looking for checkpoints to resume training...")
         latest_checkpoint = nn.persistence.find_latest_checkpoint()
         if latest_checkpoint and nn.load_latest_checkpoint():
             resume_epoch = latest_checkpoint.get('epoch', 0)
             resume_patience_counter = latest_checkpoint.get('patience_counter', 0)
+            resume_best_loss = latest_checkpoint.get('best_val_loss', None)
             logger.info(f"Resumed from checkpoint successfully!")
             logger.info(f"Loaded from epoch {resume_epoch} with validation loss {latest_checkpoint.get('validation_loss', 'unknown')}")
             logger.info(f"Resumed patience counter: {resume_patience_counter}")
+            if resume_best_loss is not None:
+                logger.info(f"Resumed best validation loss: {resume_best_loss:.6f}")
             trained = False  # Continue training from checkpoint
         else:
             logger.info("No existing model or checkpoints found. Will train from scratch.")
@@ -474,7 +562,8 @@ if __name__ == "__main__":
                 checkpoint_interval=constants.DEFAULT_CHECKPOINT_INTERVAL,
                 early_stopping_patience=constants.DEFAULT_EARLY_STOPPING_PATIENCE,
                 start_epoch=resume_epoch,
-                resume_patience_counter=resume_patience_counter
+                resume_patience_counter=resume_patience_counter,
+                resume_best_loss=resume_best_loss
             )
             
             logger.info("Training completed successfully!")
@@ -486,7 +575,11 @@ if __name__ == "__main__":
                 logger.info(f"   Best loss: {training_results['best_validation_loss']:.6f}")
             
             trained = True
-            
+
+            # Save the final trained model for future runs
+            nn.save_weights("final_trained_model.npz")
+            logger.info("Final trained model saved as 'final_trained_model.npz'")
+
         except ValueError as e:
             logger.error(f"Training failed - no training data: {e}")
             trained = False
@@ -498,33 +591,62 @@ if __name__ == "__main__":
     # Test predictions and analyze performance if we have a trained network
     if trained:
         logger.info("Testing predictions...")
-        
-        # Example test parameters for demonstration
+
+        # Quick example test parameters for demonstration
         test_parameter_sets = [
             [5, 1, 1.0, 0.8, 0.5, 1.0],   # Small TBG system
-            [7, 1, 1.1, 0.9, 0.6, 1.1],   # Medium TBG system  
+            [7, 1, 1.1, 0.9, 0.6, 1.1],   # Medium TBG system
             [13, 1, 1.2, 0.7, 0.4, 0.9],  # Larger TBG system
-            [17, 1, 1.3, 0.8, 0.5, 1.0],  # Large TBG system
         ]
-        
+
         for i, params in enumerate(test_parameter_sets, 1):
             try:
                 k_x, k_y, velocity = nn.predict(params)
                 logger.info(f"  Test {i}: k=({k_x:.4f}, {k_y:.4f}), v={velocity:.2f}")
             except Exception as e:
                 logger.warning(f"  Test {i}: Failed - {e}")
-        
-        # Performance benchmarking
-        try:
-            benchmark_results = nn.benchmark_acceleration_factor(
-                test_parameter_sets[:2], num_iterations=3
-            )
-            
-            if "error" not in benchmark_results:
-                logger.info(f"Network is {benchmark_results['acceleration_factor']:.1f}x faster than physics")
-            
-        except Exception:
-            pass
+
+        # Generate benchmark test suite (if not already exists)
+        benchmark_suite_path = os.path.join(constants.PATH, "benchmark_test_suite.json")
+        if not os.path.exists(benchmark_suite_path):
+            logger.info("\nGenerating benchmark test suite...")
+            try:
+                designer = benchmark_test_suite()
+                designer.analyze_training_data()
+                suite = designer.generate_benchmark_suite()
+                designer.save_benchmark_suite(suite)
+                logger.info("Benchmark test suite generated successfully!")
+            except Exception as e:
+                logger.warning(f"Failed to generate benchmark suite: {e}")
+                logger.warning("Skipping comprehensive benchmark.")
+                suite = None
+        else:
+            logger.info(f"\nBenchmark test suite already exists: {benchmark_suite_path}")
+            suite = True  # Indicator that suite exists
+
+        # Run comprehensive benchmark suite
+        if suite is not None:
+            logger.info("\nRunning comprehensive benchmark suite...")
+            logger.info("This includes ~300 parameter sets: weight interpolation/extrapolation, threshold extrapolation,")
+            logger.info("scaling invariance, coprime extrapolation, and redundancy pairs")
+            try:
+                benchmark_summary = run_comprehensive_benchmark(
+                    model_path="final_trained_model.npz",
+                    output_prefix="baseline",
+                    num_iterations=5
+                )
+
+                if "error" not in benchmark_summary:
+                    logger.info("\nComprehensive benchmark completed successfully!")
+                    logger.info("Results saved to:")
+                    logger.info("  - baseline_benchmark_results.json (full results)")
+                    logger.info("  - baseline_benchmark_summary.json (summary statistics)")
+                    logger.info("  - baseline_benchmark_summary.txt (human-readable summary)")
+                else:
+                    logger.warning(f"Comprehensive benchmark failed: {benchmark_summary['error']}")
+
+            except Exception as e:
+                logger.warning(f"Comprehensive benchmark failed: {e}")
         
         # Display statistics
         try:

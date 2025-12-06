@@ -127,17 +127,25 @@ class dirac_network_persistence:
                 self._create_backup(filepath)
             
             weights_data = {}
-            
-            # Save weights from all layers (skip input layer which is dummy)
+
+            # Save weights and biases from all layers (skip input layer which is dummy)
             for layer_idx, layer in enumerate(self.current_network.layers[1:], 1):
                 layer_weights = []
+                layer_biases = []
                 for neuron_idx, neuron in enumerate(layer.neurons):
                     neuron_weights = []
                     for input_neuron, weight in neuron.inputs:
                         neuron_weights.append(weight)
                     layer_weights.append(neuron_weights)
-                
+
+                    # Save bias (0.0 for backward compatibility if neuron doesn't have bias)
+                    if hasattr(neuron, 'bias'):
+                        layer_biases.append(neuron.bias)
+                    else:
+                        layer_biases.append(constants.DEFAULT_BIAS_INIT)
+
                 weights_data[f'layer_{layer_idx}_weights'] = np.array(layer_weights)
+                weights_data[f'layer_{layer_idx}_biases'] = np.array(layer_biases)
             
             # Save network architecture metadata
             weights_data['num_layers'] = len(self.current_network.layers)
@@ -197,9 +205,9 @@ class dirac_network_persistence:
             
             if not os.path.exists(filepath):
                 raise FileNotFoundError(f"Weight file not found: {filepath}")
-            
-            # Load weights data
-            weights_data = np.load(filepath)
+
+            # Load weights data (allow_pickle=True for object arrays in metadata)
+            weights_data = np.load(filepath, allow_pickle=True)
             
             # Extract metadata
             metadata = {}
@@ -222,27 +230,39 @@ class dirac_network_persistence:
                     continue
                 
                 layer_weights = weights_data[weight_key]
-                
-                # Set weights for each neuron in this layer
+
+                # Load biases if available (for backward compatibility with old models)
+                bias_key = f'layer_{layer_idx}_biases'
+                layer_biases = weights_data[bias_key] if bias_key in weights_data else None
+
+                # Set weights and biases for each neuron in this layer
                 for neuron_idx, neuron in enumerate(layer.neurons):
                     if neuron_idx >= len(layer_weights):
                         logger.warning(f"Insufficient weights for layer {layer_idx}, neuron {neuron_idx}")
                         continue
-                    
+
                     neuron_weights = layer_weights[neuron_idx]
-                    
+
                     # Update connection weights
                     for input_idx, (input_neuron, old_weight) in enumerate(neuron.inputs):
                         if input_idx >= len(neuron_weights):
                             continue
-                        
+
                         new_weight = float(neuron_weights[input_idx])
                         neuron.change_weight(input_neuron, new_weight)
-                        
+
                         # Update ADAM optimizer weight
                         if hasattr(neuron, 'Adam_corrector') and input_idx < len(neuron.Adam_corrector):
                             neuron.Adam_corrector[input_idx].weight = new_weight
-                
+
+                    # Update bias if available
+                    if layer_biases is not None and neuron_idx < len(layer_biases):
+                        if hasattr(neuron, 'bias'):
+                            neuron.bias = float(layer_biases[neuron_idx])
+                            # Update bias ADAM optimizer weight
+                            if hasattr(neuron, 'bias_adam') and neuron.bias_adam is not None:
+                                neuron.bias_adam.weight = neuron.bias
+
                 loaded_layers += 1
             
             weights_data.close()  # Clean up numpy file handle

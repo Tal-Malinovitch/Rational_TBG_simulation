@@ -77,19 +77,50 @@ The framework combines:
 
 ## 🚀 Quick Start
 
-### Option 1: Interactive GUI
+### Recommended Workflow: Generate Data + Train Network
+
+**Step 1: Generate training data with automatic checkpointing**
+```bash
+cd "C:\Users\talth\Dropbox\Professional\pythings\TBG project"
+python NN_Dirac_point.py --generate-data
+```
+
+This will:
+- ✅ Generate high-quality training data using 12 CPU cores (4 reserved for you)
+- ✅ Save checkpoints every 100 samples (crash recovery)
+- ✅ Automatically resume if interrupted
+- ✅ Proceed to network training when complete
+- ✅ Save final trained model
+
+**Step 2: Use the trained model**
+```bash
+python NN_Dirac_point.py  # Loads trained model and runs benchmarks
+```
+
+**Features**:
+- **Parallel processing**: Uses 4 parallel workers (8 cores reserved + hard limit to prevent freeze)
+- **Process priority**: Workers run at BELOW_NORMAL priority (user apps get priority)
+- **Checkpoint system**: Automatic save/resume for both data generation and training
+- **Quality validation**: Strict thresholds (gap<0.001, R²<0.05, weighted<0.05)
+- **Expanded coverage**: 13 a-values [2,3,4,5,6,7,8,9,10,13,15,17,19]
+
+---
+
+### Alternative Options
+
+**Option 1: Interactive GUI**
 ```bash
 python GuiFile.py
 ```
 Launch the main GUI for interactive TBG exploration with real-time parameter adjustment.
 
-### Option 2: Data Analysis GUI
+**Option 2: Data Analysis GUI**
 ```bash
 python gui_data_analysis.py
 ```
 Open the data analysis interface for examining training datasets and model performance.
 
-### Option 3: Neural Network Training
+**Option 3: Direct Neural Network Training (if data exists)**
 ```python
 from NN_Dirac_point import nn_dirac_point
 
@@ -180,26 +211,44 @@ pip install -r requirements.txt
 
 ## 🧠 Neural Network Architecture
 
-The neural network system uses a modular architecture with specialized components:
+The neural network system uses a specialized architecture designed for multi-valued Dirac point prediction:
 
-### Network Design
-- **Input Layer**: 6 features (a, b, interlayer_threshold, intralayer_threshold, inter_weight, intra_weight)
-- **Hidden Layers**: Configurable ReLU layers (default: 2 layers × 8 neurons)
-- **Output Layer**: 3 features with mixed activation (wrapped k_x, k_y + ReLU velocity)
+### Current Network Design (Dec 2025)
+- **Input Layer**: 6 features with critical transformation:
+  - Raw parameters: (a, b, interlayer_threshold, intralayer_threshold, inter_weight, intra_weight)
+  - **Input transformation**: (a,b) → (1/a, 1/b) to normalize scale (a,b ∈ [2,333] → [0.003, 0.5])
+  - Other parameters already in [0.15, 1.8] range - no transformation needed
+- **Hidden Layers**: 3 layers × 30 neurons with softsign activation (default configuration)
+  - Currently testing optimal capacity: 10-10-10 (too small), 20-20-20 (good), 30-30-30 (testing), 40-40-40 (collapsed)
+- **Output Layer**: 6 features predicting TWO Dirac points simultaneously
+  - Outputs: [k_x1, k_y1, nu1, k_x2, k_y2, nu2]
+  - k-points use wrapped coordinates (periodic boundary conditions)
+  - nu converted to velocity: v = (1-nu)/nu
+
+### Multi-Valued Prediction Challenge
+TBG systems have **2-8 different Dirac points** for the same parameters. The network must:
+- Learn to predict multiple valid solutions (not just one)
+- Avoid mode collapse (predicting constant values)
+- Balance Coulomb repulsion (force predictions apart) with accuracy
 
 ### Training Strategy
-1. **Data Pretraining**: Learn general patterns from historical Dirac point calculations
-2. **Physics Fine-tuning**: Optimize using a physics-based loss function for specific parameters
-3. **Early Stopping**: Prevent overfitting with validation loss monitoring
-4. **Learning Rate Decay**: Adaptive learning rate based on training progress
+1. **Minimum Distance Loss**: Each prediction compared to CLOSEST target among all valid Dirac points
+2. **Coulomb Repulsion**: Penalty term forces two predictions to be different
+3. **Early Stopping**: Monitors validation loss with patience=50 epochs
+4. **Gradient Clipping**: Clip to ±2.0 to prevent explosion
+5. **Learning Rate Reduction**: Halve LR when loss plateaus (min: 1e-6)
 
-### Performance Goals & Capabilities
-- **Speed Target**: Designed to significantly accelerate Dirac point calculations vs. direct physics methods
-- **Prediction Accuracy**: Framework optimized for high-precision k-point and velocity predictions
-- **Scalability**: Efficiently handles large TBG systems with thousands of nodes
-- **Benchmarking**: Built-in performance analysis tools for measuring acceleration factors
+### Current Training Results (Dec 2025)
+- **Training data**: 25,362 parameter sets → 49,248 Dirac points (avg 1.94 per parameter set)
+- **Data variance**: k_x std=0.261, k_y std=0.236 (target for network to achieve)
+- **Best architecture so far**: 20-20-20 network
+  - Achieves 78% of training data variance (Pred1 k_x std=0.203 vs 0.261 target)
+  - Validation loss: 0.092368
+  - Shows network is learning to explore k-space, not fully capturing all modes
+- **Challenges**: Larger networks (40-40-40) show training instability and mode collapse
+- **Status**: Testing 30-30-30 as optimal middle ground
 
-*Note: Comprehensive performance benchmarks will be updated as training progresses and validation completes.*
+*Note: This is an active research project. Performance metrics updated as training experiments complete.*
 
 ---
 
@@ -247,6 +296,97 @@ ADAM_LEARNING_RATE = 0.01         # Default learning rate
 - **Small systems** (a,b ≤ 7): 4GB RAM, <1 minute computation
 - **Medium systems** (7 < a,b ≤ 13): 8GB RAM, 1-5 minutes
 - **Large systems** (a,b > 13): 16GB+ RAM, 5+ minutes
+
+---
+
+## 🔄 Checkpoint System & Crash Recovery
+
+### Data Generation Checkpoints
+- **File**: `training_checkpoint.json` (project root)
+- **Saves every**: 100 samples (automatic)
+- **Resume**: Automatically loads on restart
+- **Command**: `python NN_Dirac_point.py --generate-data` (same command to resume)
+
+### Network Training Checkpoints
+- **Files**: `checkpoint_epoch_XXX.npz` (e.g., `checkpoint_epoch_050.npz`)
+- **Saves every**: 10 epochs (configurable)
+- **Resume**: Automatically loads latest checkpoint
+- **Command**: `python NN_Dirac_point.py` (same command to resume)
+
+**Interruption Handling**:
+- Press Ctrl+C to stop gracefully (checkpoint saves)
+- Resume with same command - progress restored automatically
+- No work lost - all progress saved incrementally
+
+---
+
+## ⚙️ Parallel Processing Configuration
+
+### Current Setup (Updated 2025-11-07 - Fixed after system freeze)
+- **Total CPU cores**: 16 logical processors
+- **Reserved for user**: 8 cores (INCREASED from 4 after testing showed freeze)
+- **Hard limit**: 4 parallel processes maximum (prevents freeze)
+- **Actual processes used**: 4 = min(16 - 8, 4)
+- **Process priority**: BELOW_NORMAL (workers don't compete with user apps)
+- **Configuration file**: [constants.py](constants.py) (lines 113-116)
+
+### Adjusting Core Usage
+Edit `constants.py` to change limits:
+```python
+RESERVED_CORES: int = 8  # Cores reserved for user work (currently 8)
+MAX_PARALLEL_PROCESSES: int = 4  # HARD LIMIT - reduce to 2-3 if still freezing
+```
+
+**⚠ IMPORTANT**: Do NOT increase MAX_PARALLEL_PROCESSES above 4! Each worker processes 12 weight combinations internally (CPU-intensive). More than 4 workers can freeze your system.
+
+---
+
+## 🐛 Troubleshooting
+
+### Data Generation Issues
+
+**Problem**: "No training data generated"
+- ✓ Check `Training_data/` directory exists
+- ✓ Check disk space available
+- ✓ Review `training_output.log` for error details
+
+**Problem**: Process killed or crashed
+- ✓ Checkpoint saved automatically in `training_checkpoint.json`
+- ✓ Resume with: `python NN_Dirac_point.py --generate-data`
+- ✓ Check log for last processed parameters
+
+**Problem**: Computer too slow or unresponsive
+- ✓ Increase `RESERVED_CORES` in `constants.py` (from 4 to 6 or 8)
+- ✓ This leaves more CPU cores for your work
+- ✓ Generation will take longer but system stays responsive
+
+### Network Training Issues
+
+**Problem**: "No training data found"
+- ✓ Run data generation first: `python NN_Dirac_point.py --generate-data`
+- ✓ Check `Training_data/dirac_training_data.csv` exists and has data
+
+**Problem**: Training crashes or stops
+- ✓ Check for checkpoint files: `checkpoint_epoch_XXX.npz`
+- ✓ Resume automatically: `python NN_Dirac_point.py`
+- ✓ Review `training_output.log` for error messages
+
+**Problem**: Loss not decreasing
+- ✓ Verify data quality (new thresholds: gap<0.001, R²<0.05)
+- ✓ Check learning rate (default: 0.0001 in constants.py)
+- ✓ Review validation loss trends in logs
+
+### General Issues
+
+**Problem**: Import errors or missing modules
+- ✓ Ensure all dependencies installed: `pip install -r requirements.txt`
+- ✓ Check Python version: Python 3.12 recommended
+- ✓ Verify virtual environment activated
+
+**Problem**: Out of memory errors
+- ✓ Close other applications
+- ✓ Reduce batch size in training config
+- ✓ For data generation: reduce number of parallel processes
 
 ---
 
@@ -311,7 +451,8 @@ The framework includes comprehensive performance measurement capabilities:
 - **NN Prediction**: Forward pass through trained network with preprocessing
 - **Validation**: Cross-validation against physics calculations for accuracy assessment
 
-*Detailed performance results will be published as training and validation are complete.*
+*Detailed performance results will be published as training and validation complete.*
+
 ---
 
 ## 🛠️ Troubleshooting
@@ -489,8 +630,35 @@ Rice University
 
 ---
 
-*Last Updated: September 2025*
-*Framework Version: 2.1.0*
+---
 
+## 🚧 Project Status
+
+This is an **active research project** currently in development:
+
+### Current Phase (December 2025)
+- ✅ Core physics engine complete and validated
+- ✅ Training data generation pipeline operational (25,362 parameter sets)
+- ✅ Input transformation bug fixed (critical for learning)
+- 🔄 Neural network architecture optimization in progress
+  - Testing capacity scaling: 10→20→30→40 neuron architectures
+  - Investigating multi-valued prediction strategies
+  - Measuring variance recovery and mode collapse behavior
+- ⏳ Comprehensive benchmarking pending (awaits optimal architecture)
+- ⏳ Performance validation in progress
+
+### Known Limitations
+- Multi-valued prediction remains challenging (78% variance recovery with best architecture)
+- Larger networks show training instability and mode collapse
+- Optimal architecture size still under investigation
+- Comprehensive acceleration factor benchmarks not yet published
+
+### Future Work
+- Alternative architectures: mixture of experts, multiple output heads
+- Alternative loss functions: mixture density networks, k-means style assignment
+- Data augmentation strategies
+- Production deployment and optimization
+
+*Last Updated: December 2025*
+*Framework Version: 2.2.0 (Active Development)*
 *Documentation Status: ✅ Complete with comprehensive type hints and professional docstrings*
-
